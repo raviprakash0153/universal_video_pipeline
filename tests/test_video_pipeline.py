@@ -35,10 +35,130 @@ class OutputProtectionTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"keep me")
 
     def test_long_render_uses_no_overwrite_flag(self):
-        with patch.object(pipeline, "run") as run:
-            with patch.object(pipeline, "verify"):
-                pipeline.render_long(Path("source.mp4"), Path("out.mp4"), 0, None)
-        self.assertEqual(run.call_args.args[0][:2], ["ffmpeg", "-n"])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out.mp4"
+            def fake_run(command, **kwargs):
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "run", side_effect=fake_run) as run, \
+                    patch.object(pipeline, "verify"), patch.object(pipeline.os, "link"):
+                pipeline.render_long(Path("source.mp4"), output, 0, None)
+            self.assertEqual(run.call_args.args[0][:2], ["ffmpeg", "-y"])
+
+
+class LongRenderTests(unittest.TestCase):
+    def render_command(self, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "final.mp4"
+            commands = []
+            def fake_run(command, **run_kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "run", side_effect=fake_run), \
+                    patch.object(pipeline, "verify"), patch.object(pipeline.os, "link"):
+                pipeline.render_long(Path("source.mp4"), output, 0, None, **kwargs)
+            command = commands[0]
+            return command[command.index("-vf") + 1], command[command.index("-af") + 1]
+
+    def test_default_filter_values_preserve_legacy_filters(self):
+        vf, af = self.render_command()
+        self.assertTrue(vf.endswith("eq=contrast=1.03:saturation=1.05"))
+        self.assertEqual(af, "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0")
+
+    def test_custom_video_and_audio_filter_values(self):
+        vf, af = self.render_command(brightness=0.2, contrast=1.2, saturation=0.8,
+                                     volume=1.4, bass_gain=3)
+        self.assertTrue(vf.endswith("eq=brightness=0.2:contrast=1.2:saturation=0.8"))
+        self.assertEqual(af, "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume=1.4,bass=g=3")
+
+    def test_each_custom_filter_control(self):
+        expected = (("brightness", 0.1, "brightness=0.1"),
+                    ("contrast", 1.2, "contrast=1.2"),
+                    ("saturation", 1.2, "saturation=1.2"),
+                    ("volume", 1.2, "volume=1.2"),
+                    ("bass_gain", 2.0, "bass=g=2"))
+        for name, value, fragment in expected:
+            with self.subTest(name=name):
+                vf, af = self.render_command(**{name: value})
+                self.assertIn(fragment, vf if name in {"brightness", "contrast", "saturation"} else af)
+
+    def test_numeric_arguments_reject_invalid_nonfinite_and_unreasonable_values(self):
+        cases = (("brightness", "bad"), ("contrast", "nan"), ("saturation", "inf"),
+                 ("volume", "-inf"), ("bass_gain", "100"), ("brightness", "2"))
+        types = {"brightness": pipeline.bounded_number(-1, 1, "Brightness"),
+                 "contrast": pipeline.bounded_number(0, 3, "Contrast"),
+                 "saturation": pipeline.bounded_number(0, 3, "Saturation"),
+                 "volume": pipeline.bounded_number(0, 10, "Volume"),
+                 "bass_gain": pipeline.bounded_number(-20, 20, "Bass gain")}
+        for name, value in cases:
+            with self.subTest(name=name, value=value), self.assertRaises(argparse.ArgumentTypeError):
+                types[name](value)
+
+    def test_audio_less_mapping_remains_optional(self):
+        vf, af = self.render_command()
+        self.assertIsInstance(vf, str)
+        # Audio map remains optional, so FFmpeg accepts a source with no audio stream.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "final.mp4"
+            def fake_run(command, **kwargs):
+                self.assertIn("0:a?", command)
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "run", side_effect=fake_run), patch.object(pipeline, "verify"), \
+                    patch.object(pipeline.os, "link"):
+                pipeline.render_long(Path("silent.mp4"), output, 0, None)
+
+    def test_ffmpeg_and_probe_failures_clean_temporary_file(self):
+        for failure in ("ffmpeg", "probe"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "final.mp4"
+                captured = []
+                def fail(command, **kwargs):
+                    temp = Path(command[-1])
+                    captured.append(temp)
+                    temp.write_bytes(b"partial")
+                    raise RuntimeError("failure")
+                with patch.object(pipeline, "run", side_effect=fail if failure == "ffmpeg" else lambda *a, **k: None), \
+                        patch.object(pipeline, "verify", side_effect=RuntimeError("failure") if failure == "probe" else None):
+                    if failure == "probe":
+                        def write_then_verify(command, **kwargs):
+                            Path(command[-1]).write_bytes(b"encoded")
+                            captured.append(Path(command[-1]))
+                        pipeline.run = unittest.mock.Mock(side_effect=write_then_verify)
+                    with self.assertRaises(RuntimeError):
+                        pipeline.render_long(Path("source.mp4"), output, 0, None)
+                self.assertFalse(output.exists())
+                self.assertFalse(captured[0].exists())
+
+    def test_verify_rejects_missing_video_stream(self):
+        with patch.object(pipeline, "run", return_value=types.SimpleNamespace(stdout='{"streams":[{"codec_type":"audio"}]}')):
+            with self.assertRaisesRegex(ValueError, "video stream"):
+                pipeline.verify(Path("bad.mp4"))
+
+    def test_existing_output_preserved_and_success_published_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "final.mp4"
+            output.write_bytes(b"keep")
+            def encode(command, **kwargs):
+                Path(command[-1]).write_bytes(b"new")
+            with patch.object(pipeline, "run", side_effect=encode), patch.object(pipeline, "verify"), \
+                    patch.object(pipeline.os, "link", side_effect=FileExistsError):
+                with self.assertRaises(FileExistsError):
+                    pipeline.render_long(Path("source.mp4"), output, 0, None)
+            self.assertEqual(output.read_bytes(), b"keep")
+            self.assertEqual(list(root.glob(".final_*.mp4")), [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "final.mp4"
+            def encode(command, **kwargs):
+                Path(command[-1]).write_bytes(b"new")
+            def link(src, dst):
+                Path(dst).hardlink_to(src)
+            with patch.object(pipeline, "run", side_effect=encode), patch.object(pipeline, "verify"), \
+                    patch.object(pipeline.os, "link", side_effect=link):
+                pipeline.render_long(Path("source.mp4"), output, 0, None)
+            self.assertEqual(output.read_bytes(), b"new")
+            self.assertEqual(list(root.glob(".final_*.mp4")), [])
 
 
 class TemporaryCleanupTests(unittest.TestCase):
@@ -127,7 +247,7 @@ class YouTubeMetadataTests(unittest.TestCase):
                     patch.object(pipeline, "require_tool"), \
                     patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 30, "local": True}), \
                     patch.object(pipeline, "acquire", return_value=Path("source.mp4")), \
-                    patch.object(pipeline, "render_long", side_effect=lambda source, path, start, end: path.write_bytes(b"video")), \
+                    patch.object(pipeline, "render_long", side_effect=lambda source, path, start, end, *filters: path.write_bytes(b"video")), \
                     patch.object(pipeline, "upload_youtube") as upload:
                 with patch("builtins.print"):
                     pipeline.main()

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import math
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -188,31 +189,65 @@ def render_short(source: Path, output: Path, start: float, end: float, subtitle_
         temp.unlink(missing_ok=True)
         ass.unlink(missing_ok=True)
 
-def render_long(source: Path, output: Path, start: float, end: float | None):
+def bounded_number(minimum: float, maximum: float, label: str):
+    def parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label} must be a number.") from exc
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{label} must be finite and between {minimum:g} and {maximum:g}.")
+        return number
+    return parse
+
+
+def render_long(source: Path, output: Path, start: float, end: float | None,
+                brightness: float = 0, contrast: float = 1.03, saturation: float = 1.05,
+                volume: float = 1.0, bass_gain: float = 0):
     if not math.isfinite(start) or start < 0 or (end is not None and (not math.isfinite(end) or end <= start)):
         raise ValueError("Start and end must be finite, non-negative times with end after start.")
-    cmd = ["ffmpeg", "-n"]
-    if start > 0:
-        cmd += ["-ss", ff_time(start)]
-    cmd += ["-i", str(source)]
-    if end is not None:
-        if end <= start:
-            raise ValueError("End time must be after start time.")
-        cmd += ["-t", ff_time(end-start)]
-    cmd += ["-map", "0:v:0", "-map", "0:a?",
-            "-vf", "setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,eq=contrast=1.03:saturation=1.05",
-            "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", str(output)]
-    run(cmd)
-    verify(output)
+    temp_handle = tempfile.NamedTemporaryFile(prefix=f".{output.stem}_", suffix=".mp4",
+                                              dir=output.parent, delete=False)
+    temp = Path(temp_handle.name)
+    temp_handle.close()
+    try:
+        cmd = ["ffmpeg", "-y"]
+        if start > 0:
+            cmd += ["-ss", ff_time(start)]
+        cmd += ["-i", str(source)]
+        if end is not None:
+            cmd += ["-t", ff_time(end-start)]
+        video_filter = "setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        if (brightness, contrast, saturation) == (0, 1.03, 1.05):
+            video_filter += ",eq=contrast=1.03:saturation=1.05"
+        else:
+            video_filter += f",eq=brightness={brightness:g}:contrast={contrast:g}:saturation={saturation:g}"
+        audio_filter = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+        if volume != 1.0:
+            audio_filter += f",volume={volume:g}"
+        if bass_gain != 0:
+            audio_filter += f",bass=g={bass_gain:g}"
+        cmd += ["-map", "0:v:0", "-map", "0:a?",
+                "-vf", video_filter,
+                "-af", audio_filter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(temp)]
+        run(cmd)
+        verify(temp)
+        os.link(temp, output)
+    finally:
+        temp.unlink(missing_ok=True)
 
 def verify(path: Path):
     result = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time,width,height",
                   "-of", "json", str(path)], capture=True)
     data = json.loads(result.stdout)
-    print("OUTPUT CHECK:", data.get("streams", []))
+    streams = data.get("streams", [])
+    if not any(stream.get("codec_type") == "video" for stream in streams):
+        raise ValueError("Output verification failed: no valid video stream was found.")
+    print("OUTPUT CHECK:", streams)
 
 def upload_youtube(path: Path, title: str, description: str, privacy: str, client_file: Path,
                    tags: list[str] | None = None, category_id: str = "22"):
@@ -270,6 +305,11 @@ def main():
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
     parser.add_argument("--tag", action="append", default=[], help="Video tag; repeat to add multiple tags")
     parser.add_argument("--category-id", default="22", help="YouTube category ID (default: 22)")
+    parser.add_argument("--brightness", type=bounded_number(-1, 1, "Brightness"), default=0)
+    parser.add_argument("--contrast", type=bounded_number(0, 3, "Contrast"), default=1.03)
+    parser.add_argument("--saturation", type=bounded_number(0, 3, "Saturation"), default=1.05)
+    parser.add_argument("--volume", type=bounded_number(0, 10, "Volume"), default=1.0)
+    parser.add_argument("--bass-gain", type=bounded_number(-20, 20, "Bass gain"), default=0)
     args = parser.parse_args()
 
     require_tool("ffmpeg")
@@ -327,7 +367,8 @@ def main():
                 validate_range(start, args.end, info["duration"])
             except ValueError as exc:
                 raise SystemExit(str(exc)) from exc
-        render_long(source, out, start, args.end)
+        render_long(source, out, start, args.end, args.brightness, args.contrast,
+                    args.saturation, args.volume, args.bass_gain)
         outputs.append(out)
 
     print("\nFinished files:")
