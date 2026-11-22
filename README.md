@@ -59,6 +59,17 @@ Disable subtitles:
 python video_pipeline.py shorts --source "input.mp4" --clip 00:00:20-00:00:55 --no-subtitles
 ```
 
+Add a title and channel lower-third (disabled by default):
+```bash
+python video_pipeline.py shorts --source "input.mp4" --clip 00:00:20-00:00:55 \
+  --banner --channel-name "My Channel"
+python video_pipeline.py long --source "input.mp4" --banner --channel-name "My Channel"
+```
+
+For URL sources, the banner uses the source title and uploader/channel metadata. For local files,
+it uses the filename as the title and `--channel-name` for the channel line. `--title` overrides
+the displayed title. The banner uses `/System/Library/Fonts/Geneva.ttf`.
+
 ## 3. Make a long-form 16:9 video
 
 Whole source:

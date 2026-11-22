@@ -24,6 +24,7 @@ from source_video_quality import quality_format_selector, validate_video_formats
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "output"
 WORK = ROOT / "work"
+TITLE_BANNER_FONT = Path("/System/Library/Fonts/Geneva.ttf")
 OUTPUT.mkdir(exist_ok=True)
 WORK.mkdir(exist_ok=True)
 
@@ -47,12 +48,13 @@ def get_info(source: str) -> dict:
         probe = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                      "-of", "json", str(p)], capture=True)
         duration = float(json.loads(probe.stdout)["format"]["duration"])
-        return {"title": p.stem, "duration": duration, "local": True}
+        return {"title": p.stem, "uploader": None, "duration": duration, "local": True}
     result = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
                   "--dump-single-json", "--no-download", source], capture=True)
     data = json.loads(result.stdout)
     validate_video_formats(data)
     return {"title": data.get("title") or "video",
+            "uploader": data.get("uploader") or data.get("channel") or None,
             "duration": float(data.get("duration") or 0), "local": False}
 
 def acquire(source: str, title: str) -> Path:
@@ -159,7 +161,32 @@ def escape_filter_path(path: Path) -> str:
     s = str(path.resolve()).replace("\\", "/")
     return s.replace(":", r"\:").replace("'", r"\'").replace(",", r"\,")
 
-def render_short(source: Path, output: Path, start: float, end: float, subtitle_model: str | None):
+def _filter_value_path(path: Path) -> str:
+    """Escape a path embedded in a quoted FFmpeg filter option."""
+    value = str(path.resolve()).replace("\\", "/")
+    for char in ("\\", "'", ":", ",", "[", "]", ";"):
+        value = value.replace(char, "\\" + char)
+    return value
+
+def banner_filter(width: int, height: int, title: str, channel: str, directory: Path) -> str:
+    """Write banner copy to files and return drawbox/drawtext filters using file paths."""
+    title_file = directory / "banner_title.txt"
+    channel_file = directory / "banner_channel.txt"
+    title_file.write_text(title, encoding="utf-8")
+    channel_file.write_text(channel, encoding="utf-8")
+    if height == 1920:
+        box_y, box_h, title_y, channel_y, title_size, channel_size = 1580, 230, 1615, 1690, 48, 34
+    else:
+        box_y, box_h, title_y, channel_y, title_size, channel_size = 850, 190, 875, 940, 40, 30
+    common = f":fontfile='{_filter_value_path(TITLE_BANNER_FONT)}':fontcolor=white:expansion=none"
+    return (
+        f"drawbox=x=0:y={box_y}:w={width}:h={box_h}:color=black@0.62:t=fill,"
+        f"drawtext=textfile='{_filter_value_path(title_file)}'{common}:fontsize={title_size}:x=48:y={title_y},"
+        f"drawtext=textfile='{_filter_value_path(channel_file)}'{common}:fontsize={channel_size}:x=48:y={channel_y}"
+    )
+
+def render_short(source: Path, output: Path, start: float, end: float, subtitle_model: str | None,
+                 banner: bool = False, title: str | None = None, channel: str | None = None):
     validate_range(start, end)
     duration = end - start
     temp = WORK / f"{output.stem}_trim.mp4"
@@ -180,20 +207,36 @@ def render_short(source: Path, output: Path, start: float, end: float, subtitle_
             "pad=1080:608:(ow-iw)/2:(oh-ih)/2:color=black[fg];"
             "[bg][fg]overlay=0:560[v0]"
         )
-        if words:
-            write_ass(words, ass, 1080, 1920, 64, 1370)
-            filters += f";[v0]ass='{escape_filter_path(ass)}'[v]"
-            vmap = "[v]"
+        if banner:
+            with tempfile.TemporaryDirectory(prefix="banner_", dir=WORK) as banner_dir:
+                banner_filters = banner_filter(1080, 1920, title or "", channel or "", Path(banner_dir))
+                filters += f";[v0]{banner_filters}[v0b]"
+                base_video = "[v0b]"
+                if words:
+                    write_ass(words, ass, 1080, 1920, 64, 1370)
+                    filters += f";{base_video}ass='{escape_filter_path(ass)}'[v]"
+                    vmap = "[v]"
+                else:
+                    vmap = base_video
+                _render_short_output(temp, output, filters, vmap)
         else:
-            vmap = "[v0]"
-        run(["ffmpeg", "-n", "-i", str(temp), "-filter_complex", filters,
-             "-map", vmap, "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-             "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
-             "-movflags", "+faststart", str(output)])
+            if words:
+                write_ass(words, ass, 1080, 1920, 64, 1370)
+                filters += f";[v0]ass='{escape_filter_path(ass)}'[v]"
+                vmap = "[v]"
+            else:
+                vmap = "[v0]"
+            _render_short_output(temp, output, filters, vmap)
         verify(output)
     finally:
         temp.unlink(missing_ok=True)
         ass.unlink(missing_ok=True)
+
+def _render_short_output(temp: Path, output: Path, filters: str, vmap: str):
+    run(["ffmpeg", "-n", "-i", str(temp), "-filter_complex", filters,
+         "-map", vmap, "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+         "-movflags", "+faststart", str(output)])
 
 def bounded_number(minimum: float, maximum: float, label: str):
     def parse(value: str) -> float:
@@ -210,13 +253,15 @@ def bounded_number(minimum: float, maximum: float, label: str):
 
 def render_long(source: Path, output: Path, start: float, end: float | None,
                 brightness: float = 0, contrast: float = 1.03, saturation: float = 1.05,
-                volume: float = 1.0, bass_gain: float = 0):
+                volume: float = 1.0, bass_gain: float = 0, banner: bool = False,
+                title: str | None = None, channel: str | None = None):
     if not math.isfinite(start) or start < 0 or (end is not None and (not math.isfinite(end) or end <= start)):
         raise ValueError("Start and end must be finite, non-negative times with end after start.")
     temp_handle = tempfile.NamedTemporaryFile(prefix=f".{output.stem}_", suffix=".mp4",
                                               dir=output.parent, delete=False)
     temp = Path(temp_handle.name)
     temp_handle.close()
+    banner_temp = None
     try:
         cmd = ["ffmpeg", "-y"]
         if start > 0:
@@ -229,6 +274,9 @@ def render_long(source: Path, output: Path, start: float, end: float | None,
             video_filter += ",eq=contrast=1.03:saturation=1.05"
         else:
             video_filter += f",eq=brightness={brightness:g}:contrast={contrast:g}:saturation={saturation:g}"
+        if banner:
+            banner_temp = tempfile.TemporaryDirectory(prefix="banner_", dir=WORK)
+            video_filter += "," + banner_filter(1920, 1080, title or "", channel or "", Path(banner_temp.name))
         audio_filter = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
         if volume != 1.0:
             audio_filter += f",volume={volume:g}"
@@ -245,6 +293,8 @@ def render_long(source: Path, output: Path, start: float, end: float | None,
         os.link(temp, output)
     finally:
         temp.unlink(missing_ok=True)
+        if banner_temp is not None:
+            banner_temp.cleanup()
 
 def verify(path: Path):
     result = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time,width,height",
@@ -307,6 +357,8 @@ def main():
     parser.add_argument("--upload", action="store_true")
     parser.add_argument("--client-secrets", default=str(ROOT / "client_secret.json"))
     parser.add_argument("--title", default=None)
+    parser.add_argument("--banner", action="store_true", help="Render an optional title and channel lower-third")
+    parser.add_argument("--channel-name", default=None, help="Channel name for the banner when source metadata is unavailable")
     parser.add_argument("--description", default="")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
     parser.add_argument("--tag", action="append", default=[], help="Video tag; repeat to add multiple tags")
@@ -360,7 +412,10 @@ def main():
         ensure_outputs_available(planned)
         for i, (a, b) in enumerate(ranges, 1):
             out = planned[i - 1]
-            render_short(source, out, a, b, subtitle_model)
+            banner_title = args.title or info.get("title")
+            banner_channel = info.get("uploader") or args.channel_name
+            render_short(source, out, a, b, subtitle_model, args.banner,
+                         banner_title, banner_channel)
             outputs.append(out)
     else:
         out = OUTPUT / f"{stem}_16x9.mp4"
@@ -374,7 +429,8 @@ def main():
             except ValueError as exc:
                 raise SystemExit(str(exc)) from exc
         render_long(source, out, start, args.end, args.brightness, args.contrast,
-                    args.saturation, args.volume, args.bass_gain)
+                    args.saturation, args.volume, args.bass_gain, args.banner,
+                    args.title or info.get("title"), info.get("uploader") or args.channel_name)
         outputs.append(out)
 
     print("\nFinished files:")

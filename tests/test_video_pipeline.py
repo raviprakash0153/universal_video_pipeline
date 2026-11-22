@@ -236,8 +236,49 @@ class LongRenderTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), b"new")
             self.assertEqual(list(root.glob(".final_*.mp4")), [])
 
+    def test_banner_is_opt_in_and_added_after_long_form_scaling(self):
+        plain, _ = self.render_command()
+        self.assertNotIn("drawbox", plain)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "final.mp4"
+            commands = []
+            def encode(command, **kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "WORK", Path(directory)), \
+                    patch.object(pipeline, "run", side_effect=encode), patch.object(pipeline, "verify"), \
+                    patch.object(pipeline.os, "link"):
+                pipeline.render_long(Path("source.mp4"), output, 0, None, banner=True,
+                                     title="A title", channel="A channel")
+            vf = commands[0][commands[0].index("-vf") + 1]
+            self.assertIn("drawbox", vf)
+            self.assertLess(vf.index("scale="), vf.index("drawbox"))
+            self.assertEqual(list(Path(directory).glob("banner_*")), [])
+
 
 class TemporaryCleanupTests(unittest.TestCase):
+    def test_short_banner_renders_and_is_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            output = work / "clip.mp4"
+            commands = []
+            def encode(command, **kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "WORK", work), patch.object(pipeline, "run", side_effect=encode), \
+                    patch.object(pipeline, "verify"):
+                pipeline.render_short(Path("source.mp4"), output, 0, 2, None)
+            short_filter = commands[-1][commands[-1].index("-filter_complex") + 1]
+            self.assertNotIn("drawbox", short_filter)
+            commands.clear()
+            with patch.object(pipeline, "WORK", work), patch.object(pipeline, "run", side_effect=encode), \
+                    patch.object(pipeline, "verify"):
+                pipeline.render_short(Path("source.mp4"), output, 0, 2, None, banner=True,
+                                      title="title", channel="channel")
+            short_filter = commands[-1][commands[-1].index("-filter_complex") + 1]
+            self.assertIn("drawbox", short_filter)
+            self.assertEqual(list(work.glob("banner_*")), [])
+
     def test_short_render_cleans_intermediates_after_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
@@ -255,6 +296,62 @@ class TemporaryCleanupTests(unittest.TestCase):
                     pipeline.render_short(Path("source.mp4"), Path("clip.mp4"), 0, 2, None)
             self.assertFalse(temp.exists())
             self.assertFalse(ass.exists())
+
+    def test_short_banner_text_files_are_cleaned_after_ffmpeg_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            def fail(command, **kwargs):
+                if "-filter_complex" in command:
+                    self.assertTrue(list(work.glob("banner_*/banner_title.txt")))
+                    self.assertIn("drawbox", command[command.index("-filter_complex") + 1])
+                    raise RuntimeError("simulated FFmpeg failure")
+                Path(command[-1]).write_bytes(b"trim")
+            with patch.object(pipeline, "WORK", work), patch.object(pipeline, "run", side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    pipeline.render_short(Path("source.mp4"), Path("clip.mp4"), 0, 2, None,
+                                          banner=True, title="x", channel="y")
+            self.assertEqual(list(work.glob("banner_*")), [])
+
+    def test_long_banner_text_files_are_cleaned_after_ffmpeg_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def fail(command, **kwargs):
+                self.assertTrue(list(root.glob("banner_*/banner_title.txt")))
+                raise RuntimeError("simulated FFmpeg failure")
+            with patch.object(pipeline, "WORK", root), patch.object(pipeline, "run", side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    pipeline.render_long(Path("source.mp4"), root / "final.mp4", 0, None,
+                                         banner=True, title="x", channel="y")
+            self.assertEqual(list(root.glob("banner_*")), [])
+
+
+class TitleBannerTests(unittest.TestCase):
+    def test_special_text_stays_in_text_files_not_filter_string(self):
+        with tempfile.TemporaryDirectory(prefix="filter,quote'") as directory:
+            root = Path(directory)
+            filters = pipeline.banner_filter(1920, 1080, "A:'quoted', [title]; %", "Canal\\name", root)
+            self.assertNotIn("A:'quoted'", filters)
+            self.assertNotIn("Canal\\name", filters)
+            self.assertEqual((root / "banner_title.txt").read_text(), "A:'quoted', [title]; %")
+            self.assertEqual((root / "banner_channel.txt").read_text(), "Canal\\name")
+            self.assertIn("drawbox", filters)
+            self.assertIn("expansion=none", filters)
+
+    def test_source_metadata_retains_uploader_and_falls_back_safely(self):
+        data = {"title": "Title", "uploader": "Uploader", "channel": "Channel", "duration": 3,
+                "formats": [{"height": 720, "vcodec": "avc1", "acodec": "aac"}]}
+        with patch.object(pipeline.Path, "exists", return_value=False), \
+                patch.object(pipeline, "run", return_value=types.SimpleNamespace(stdout=__import__("json").dumps(data))):
+            self.assertEqual(pipeline.get_info("https://example.invalid/video"), {
+                "title": "Title", "uploader": "Uploader", "duration": 3.0, "local": False
+            })
+        data = {"title": None, "uploader": None, "channel": "Channel fallback", "duration": 3,
+                "formats": [{"height": 720, "vcodec": "avc1", "acodec": "aac"}]}
+        with patch.object(pipeline.Path, "exists", return_value=False), \
+                patch.object(pipeline, "run", return_value=types.SimpleNamespace(stdout=__import__("json").dumps(data))):
+            info = pipeline.get_info("https://example.invalid/video")
+        self.assertEqual(info["title"], "video")
+        self.assertEqual(info["uploader"], "Channel fallback")
 
 
 class YouTubeMetadataTests(unittest.TestCase):
