@@ -13,6 +13,7 @@ import re
 import json
 import argparse
 from faster_whisper import WhisperModel
+from source_video_quality import quality_format_selector, validate_video_formats
 
 NODE_PATH = "/Users/raviprakash/.nvm/versions/node/v22.17.1/bin/node"
 FONTS_DIR = "/System/Library/Fonts/Supplemental"
@@ -21,8 +22,8 @@ QUEUE_DIR = os.path.join(WORKSPACE_DIR, "upload_queue")
 os.makedirs(QUEUE_DIR, exist_ok=True)
 
 VIDEO_URL = "https://www.youtube.com/watch?v=4Vz6L8B73i4"
-# Format 137 = 1920x1080 H.264 mp4, Format 140 = 128k AAC m4a
-FORMAT_SPEC = "137+140/bestvideo[height<=1080]+bestaudio/best"
+# Select the highest eligible source video with the best available audio.
+FORMAT_SPEC = quality_format_selector()
 
 CLIPS = [
     {
@@ -144,7 +145,16 @@ def process_podcast_clip(clip_info: dict, model: WhisperModel):
     print(f"   Release Slot: {clip_info['slot']}")
     print(f"=======================================================")
 
-    # 1. Ingest 1080p DASH
+    # 1. Ingest the highest eligible DASH resolution.
+    inspect_cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--js-runtimes", f"node:{NODE_PATH}",
+        "--remote-components", "ejs:github",
+        "--format", FORMAT_SPEC,
+        "--dump-single-json", "--no-download", VIDEO_URL
+    ]
+    metadata = subprocess.check_output(inspect_cmd, text=True)
+    validate_video_formats(json.loads(metadata))
     dl_cmd = [
         sys.executable, "-m", "yt_dlp",
         "--js-runtimes", f"node:{NODE_PATH}",
@@ -156,7 +166,7 @@ def process_podcast_clip(clip_info: dict, model: WhisperModel):
         "-o", raw_file,
         VIDEO_URL
     ]
-    print("▶ Step 1: Ingesting 1080p DASH clip section...")
+    print("▶ Step 1: Ingesting highest eligible DASH clip section...")
     subprocess.run(dl_cmd, check=True)
 
     # 2. Transcribe with Whisper

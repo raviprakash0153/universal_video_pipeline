@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import video_pipeline as pipeline
+import source_video_quality as quality
 
 
 class InputValidationTests(unittest.TestCase):
@@ -23,6 +24,81 @@ class InputValidationTests(unittest.TestCase):
 
     def test_valid_range(self):
         pipeline.validate_range(0, 3.5, 10)
+
+
+class SourceVideoQualityTests(unittest.TestCase):
+    def metadata(self, *heights):
+        return {"formats": [
+            *[{"format_id": str(h), "height": h, "vcodec": "avc1",
+               "acodec": "none"} for h in heights],
+            {"format_id": "audio", "height": None, "vcodec": "none", "acodec": "opus"},
+        ]}
+
+    def test_separate_video_and_audio_are_eligible(self):
+        self.assertEqual(quality.validate_video_formats(self.metadata(720, 2160)), 2160)
+
+    def test_combined_format_is_valid_fallback(self):
+        data = {"formats": [{"format_id": "combined", "height": 1080,
+                              "vcodec": "avc1", "acodec": "aac"}]}
+        self.assertEqual(quality.validate_video_formats(data), 1080)
+
+    def test_no_eligible_video_audio_pair_or_combined_format_is_rejected(self):
+        data = {"formats": [
+            {"height": 1080, "vcodec": "avc1", "acodec": "none"},
+            {"height": 480, "vcodec": "avc1", "acodec": "aac"},
+        ]}
+        with self.assertRaisesRegex(ValueError, "no video format"):
+            quality.validate_video_formats(data)
+
+    def test_highest_eligible_resolution_is_preferred(self):
+        self.assertEqual(quality.validate_video_formats(
+            self.metadata(720, 1080, 1440, 2160, 4320, 8640)), 8640)
+
+    def test_each_supported_resolution_is_accepted(self):
+        for height in (720, 1080, 1440, 2160, 4320, 8640):
+            with self.subTest(height=height):
+                self.assertEqual(quality.validate_video_formats(self.metadata(height)), height)
+
+    def test_720p_is_accepted_without_1080p(self):
+        self.assertEqual(quality.validate_video_formats(self.metadata(720)), 720)
+
+    def test_below_720p_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no video format"):
+            quality.validate_video_formats(self.metadata(480, 360))
+
+    def test_unknown_video_resolution_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no video format"):
+            quality.validate_video_formats({"formats": [{"vcodec": "avc1", "height": None}]})
+
+    def test_best_audio_and_minimum_height_are_in_selector(self):
+        selector = quality.quality_format_selector()
+        self.assertIn("+ba/", selector)
+        self.assertIn("height>=720", selector)
+        self.assertNotIn("height<=1080", selector)
+        branches = selector.split("/")
+        self.assertEqual(len(branches), 2)
+        self.assertTrue(all("height>=720" in branch for branch in branches))
+        self.assertEqual(branches, ["bv[height>=720]+ba", "b[height>=720]"])
+
+    def test_all_url_pipelines_share_strict_policy(self):
+        import clip_pipeline
+        import long_video_pipeline
+        import process_raj_podcast
+        self.assertEqual(clip_pipeline.YTDLP_FORMAT, quality.quality_format_selector())
+        self.assertEqual(long_video_pipeline.YTDLP_FORMAT, quality.quality_format_selector())
+        self.assertEqual(process_raj_podcast.FORMAT_SPEC, quality.quality_format_selector())
+        self.assertEqual(pipeline.quality_format_selector(), quality.quality_format_selector())
+
+    def test_shorts_preflight_and_download_use_identical_selector(self):
+        import clip_pipeline
+        import process_raj_podcast
+        selector = quality.quality_format_selector()
+        self.assertIn("--format", clip_pipeline.get_video_info.__code__.co_consts)
+        self.assertIn("YTDLP_FORMAT", clip_pipeline.get_video_info.__code__.co_names)
+        self.assertIn("--format", process_raj_podcast.process_podcast_clip.__code__.co_consts)
+        self.assertIn("FORMAT_SPEC", process_raj_podcast.process_podcast_clip.__code__.co_names)
+        self.assertEqual(clip_pipeline.YTDLP_FORMAT, selector)
+        self.assertEqual(process_raj_podcast.FORMAT_SPEC, selector)
 
 
 class OutputProtectionTests(unittest.TestCase):

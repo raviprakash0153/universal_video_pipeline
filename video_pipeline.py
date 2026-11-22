@@ -19,6 +19,7 @@ import math
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
+from source_video_quality import quality_format_selector, validate_video_formats
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "output"
@@ -47,8 +48,10 @@ def get_info(source: str) -> dict:
                      "-of", "json", str(p)], capture=True)
         duration = float(json.loads(probe.stdout)["format"]["duration"])
         return {"title": p.stem, "duration": duration, "local": True}
-    result = run(["yt-dlp", "--no-warnings", "--dump-single-json", "--no-download", source], capture=True)
+    result = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
+                  "--dump-single-json", "--no-download", source], capture=True)
     data = json.loads(result.stdout)
+    validate_video_formats(data)
     return {"title": data.get("title") or "video",
             "duration": float(data.get("duration") or 0), "local": False}
 
@@ -56,8 +59,11 @@ def acquire(source: str, title: str) -> Path:
     if Path(source).exists():
         return Path(source).resolve()
     target = WORK / f"{safe_name(title)}.%(ext)s"
+    metadata = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
+                    "--dump-single-json", "--no-download", source], capture=True)
+    validate_video_formats(json.loads(metadata.stdout))
     run(["yt-dlp", "--no-warnings", "--no-playlist",
-         "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+         "-f", quality_format_selector(),
          "--merge-output-format", "mp4", "-o", str(target), source])
     matches = sorted(WORK.glob(f"{safe_name(title)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not matches:

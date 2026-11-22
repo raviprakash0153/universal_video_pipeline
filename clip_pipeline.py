@@ -16,13 +16,14 @@ import json
 import argparse
 from datetime import datetime
 from faster_whisper import WhisperModel
+from source_video_quality import quality_format_selector, validate_video_formats
 
 NODE_PATH = "/Users/raviprakash/.nvm/versions/node/v22.17.1/bin/node"
 FONTS_DIR = "/System/Library/Fonts/Supplemental"
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_DIR = os.path.join(WORKSPACE_DIR, "upload_queue")
 SCHEDULE_STATE_FILE = os.path.join(WORKSPACE_DIR, "schedule_state.json")
-YTDLP_FORMAT = "299+140/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+YTDLP_FORMAT = quality_format_selector()
 
 os.makedirs(QUEUE_DIR, exist_ok=True)
 
@@ -50,6 +51,7 @@ def get_video_info(url: str):
         sys.executable, "-m", "yt_dlp",
         "--js-runtimes", f"node:{NODE_PATH}",
         "--remote-components", "ejs:github",
+        "--format", YTDLP_FORMAT,
         "--dump-json", "--no-download",
         url
     ]
@@ -58,6 +60,7 @@ def get_video_info(url: str):
         if line.strip().startswith("{") and line.strip().endswith("}"):
             try:
                 data = json.loads(line)
+                validate_video_formats(data)
                 return {
                     "title": data.get("title", "Viral Clip"),
                     "duration": int(data.get("duration", 0)),
@@ -128,13 +131,21 @@ def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: st
         sys.executable, "-m", "yt_dlp",
         "--extractor-args", "youtube:player_client=tv_embedded",
         "--format", YTDLP_FORMAT,
+        "--dump-single-json", "--no-download", url
+    ]
+    metadata = subprocess.check_output(dl_cmd, text=True)
+    validate_video_formats(json.loads(metadata))
+    dl_cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--extractor-args", "youtube:player_client=tv_embedded",
+        "--format", YTDLP_FORMAT,
         "--download-sections", f"*{clip_info['start']}-{clip_info['end']}",
         "--force-keyframes-at-cuts",
         "--merge-output-format", "mp4",
         "-o", raw_file,
         url
     ]
-    print("▶ Step 1: Ingesting 1080p DASH segment...")
+    print("▶ Step 1: Ingesting highest eligible DASH segment...")
     subprocess.run(dl_cmd, check=True)
 
     # 2. Transcribe

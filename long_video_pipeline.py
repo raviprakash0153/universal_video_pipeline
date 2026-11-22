@@ -17,10 +17,12 @@ import subprocess
 import json
 import argparse
 from datetime import datetime
+from source_video_quality import quality_format_selector, validate_video_formats
 
 NODE_PATH = "/Users/raviprakash/.nvm/versions/node/v22.17.1/bin/node"
 FONTS_DIR = "/System/Library/Fonts/Supplemental"
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+YTDLP_FORMAT = quality_format_selector()
 
 def get_video_info(url: str):
     """Extracts video title, duration, and channel metadata."""
@@ -28,6 +30,7 @@ def get_video_info(url: str):
         sys.executable, "-m", "yt_dlp",
         "--js-runtimes", f"node:{NODE_PATH}",
         "--remote-components", "ejs:github",
+        "--format", YTDLP_FORMAT,
         "--dump-json", "--no-download",
         url
     ]
@@ -36,6 +39,7 @@ def get_video_info(url: str):
         if line.strip().startswith("{") and line.strip().endswith("}"):
             try:
                 data = json.loads(line)
+                validate_video_formats(data)
                 return {
                     "title": data.get("title", "Full Video"),
                     "duration": int(data.get("duration", 0)),
@@ -60,27 +64,21 @@ def process_long_video(url: str, start_time: str = "00:12:00", end_time: str = "
     raw_file = os.path.join(WORKSPACE_DIR, "long_raw.mp4")
     edited_file = os.path.join(WORKSPACE_DIR, "long_edited.mp4")
 
-    # Step 1: Extract direct streaming URL for single-muxed format
-    print(f"▶ Step 1: Downloading {start_time} to {end_time} via fast stream copy...")
-    get_url_cmd = [
+    # Step 1: Download the requested section at the highest verified quality.
+    print(f"▶ Step 1: Downloading {start_time} to {end_time} at source quality...")
+    download_cmd = [
         sys.executable, "-m", "yt_dlp",
         "--js-runtimes", f"node:{NODE_PATH}",
         "--remote-components", "ejs:github",
         "--extractor-args", "youtube:player_client=tv_embedded",
-        "-f", "18/best[ext=mp4]",
-        "-g", url
+        "--format", YTDLP_FORMAT,
+        "--download-sections", f"*{start_time}-{end_time}",
+        "--force-keyframes-at-cuts",
+        "--merge-output-format", "mp4",
+        "-o", raw_file,
+        url
     ]
-    stream_url = subprocess.check_output(get_url_cmd, text=True).strip()
-
-    copy_cmd = [
-        "ffmpeg", "-y",
-        "-ss", start_time, "-to", end_time,
-        "-i", stream_url,
-        "-c", "copy",
-        "-avoid_negative_ts", "make_zero",
-        raw_file
-    ]
-    subprocess.run(copy_cmd, check=True)
+    subprocess.run(download_cmd, check=True)
 
     # Step 2: Apply 16:9 enhancements & copyright transformation
     print("▶ Step 2: Applying cinematic 16:9 color grading & audio enhancement...")
