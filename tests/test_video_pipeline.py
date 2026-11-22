@@ -26,6 +26,61 @@ class InputValidationTests(unittest.TestCase):
         pipeline.validate_range(0, 3.5, 10)
 
 
+class AutomaticClipRangeTests(unittest.TestCase):
+    def test_requested_clip_counts_are_exact_and_distinct(self):
+        for count in (1, 3, 5):
+            with self.subTest(count=count):
+                ranges = pipeline.automatic_clip_ranges(120, count, 35)
+                self.assertEqual(len(ranges), count)
+                self.assertEqual(len(set(ranges)), count)
+
+    def test_source_shorter_than_clip_length_shortens_clips(self):
+        ranges = pipeline.automatic_clip_ranges(8, 3, 35)
+        self.assertEqual(len(ranges), 3)
+        self.assertTrue(all(end - start < 35 for start, end in ranges))
+
+    def test_eight_second_source_produces_three_distinct_valid_ranges(self):
+        ranges = pipeline.automatic_clip_ranges(8, 3, 35)
+        self.assertEqual(len(ranges), 3)
+        self.assertEqual(len(set(ranges)), 3)
+        for start, end in ranges:
+            pipeline.validate_range(start, end, 8)
+
+    def test_exact_count_for_short_sources_when_duration_permits(self):
+        for duration, count in ((1, 1), (3.5, 3), (8, 8), (9, 5)):
+            with self.subTest(duration=duration, count=count):
+                ranges = pipeline.automatic_clip_ranges(duration, count, 35)
+                self.assertEqual(len(ranges), count)
+                self.assertEqual(len(set(ranges)), count)
+
+    def test_source_too_short_for_requested_count_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "too short"):
+            pipeline.automatic_clip_ranges(4.99, 5, 35)
+
+    def test_ranges_are_nonzero_and_within_source(self):
+        duration = 24.5
+        ranges = pipeline.automatic_clip_ranges(duration, 5, 35)
+        for start, end in ranges:
+            self.assertGreater(end, start)
+            self.assertGreaterEqual(start, 0)
+            self.assertLessEqual(end, duration)
+
+    def test_cli_rejects_short_source_before_rendering(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        source = Path(tmp.name) / "source.mp4"
+        source.write_bytes(b"source")
+        argv = ["video_pipeline.py", "shorts", "--source", str(source),
+                "--no-subtitles", "--auto-clips", "5"]
+        with patch.object(sys, "argv", argv), patch.object(pipeline, "require_tool"), \
+                patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 4.5, "local": True}), \
+                patch.object(pipeline, "acquire", return_value=source), \
+                patch.object(pipeline, "render_short") as render, patch("builtins.print"):
+            with self.assertRaisesRegex(SystemExit, "too short"):
+                pipeline.main()
+        render.assert_not_called()
+
+
 class SourceVideoQualityTests(unittest.TestCase):
     def metadata(self, *heights):
         return {"formats": [
@@ -426,6 +481,115 @@ class YouTubeMetadataTests(unittest.TestCase):
                     pipeline.main()
             self.assertEqual(upload.call_args.kwargs["category_id"], "27")
             self.assertEqual(upload.call_args.kwargs["tags"], ["podcast", "education"])
+
+
+class BothModeTests(unittest.TestCase):
+    def run_cli(self, mode, extra=(), short_error=False, long_error=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        outputs = root / "output"
+        outputs.mkdir()
+        source = root / "source.mp4"
+        source.write_bytes(b"source")
+        calls = {"short": [], "long": []}
+        def short(source_path, output, *args):
+            calls["short"].append(source_path)
+            if short_error:
+                raise RuntimeError("short render broke")
+            output.write_bytes(b"short")
+        def long(source_path, output, *args):
+            calls["long"].append(source_path)
+            if long_error:
+                raise RuntimeError("long render broke")
+            output.write_bytes(b"long")
+        argv = ["video_pipeline.py", mode, "--source", str(source), "--no-subtitles", *extra]
+        with patch.object(sys, "argv", argv), patch.object(pipeline, "OUTPUT", outputs), \
+                patch.object(pipeline, "require_tool"), \
+                patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 60, "local": True}), \
+                patch.object(pipeline, "acquire", return_value=source) as acquire, \
+                patch.object(pipeline, "render_short", side_effect=short) as rs, \
+                patch.object(pipeline, "render_long", side_effect=long) as rl, \
+                patch.object(pipeline, "upload_youtube") as upload, patch("builtins.print"):
+            try:
+                pipeline.main()
+            except BaseException as exc:
+                return root, calls, acquire, rs, rl, upload, exc
+        return root, calls, acquire, rs, rl, upload, None
+
+    def test_both_acquires_once_reuses_source_and_generates_both_outputs(self):
+        root, calls, acquire, _, _, _, error = self.run_cli(
+            "both", ["--short-clip", "1-5", "--long-start", "10", "--long-end", "30"])
+        self.assertIsNone(error)
+        acquire.assert_called_once()
+        self.assertEqual(calls["short"], [root / "source.mp4"])
+        self.assertEqual(calls["long"], [root / "source.mp4"])
+        self.assertTrue((root / "output/source_short_01.mp4").exists())
+        self.assertTrue((root / "output/source_16x9.mp4").exists())
+
+    def test_both_uploads_both_outputs_when_enabled_and_none_when_disabled(self):
+        *_, upload_off, error_off = self.run_cli("both", ["--short-clip", "1-5"])
+        self.assertIsNone(error_off)
+        upload_off.assert_not_called()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        client = Path(tmp.name) / "client.json"
+        client.write_text("placeholder")
+        *_, upload_on, error_on = self.run_cli(
+            "both", ["--short-clip", "1-5", "--upload", "--client-secrets", str(client)])
+        self.assertIsNone(error_on)
+        self.assertEqual(upload_on.call_count, 2)
+
+    def test_invalid_ranges_rejected_before_rendering(self):
+        _, _, acquire, short, long, _, error = self.run_cli(
+            "both", ["--short-clip", "1-5", "--long-start", "40", "--long-end", "70"])
+        self.assertIsInstance(error, SystemExit)
+        acquire.assert_not_called()
+        short.assert_not_called()
+        long.assert_not_called()
+
+    def test_invalid_shorts_range_does_not_acquire_source(self):
+        _, _, acquire, short, _, _, error = self.run_cli("shorts", ["--clip", "55-70"])
+        self.assertIsInstance(error, SystemExit)
+        acquire.assert_not_called()
+        short.assert_not_called()
+
+    def test_valid_url_job_acquires_source_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outputs = root / "output"
+            outputs.mkdir()
+            downloaded = root / "downloaded.mp4"
+            argv = ["video_pipeline.py", "shorts", "--source", "https://example.invalid/video",
+                    "--clip", "1-5", "--no-subtitles"]
+            with patch.object(sys, "argv", argv), patch.object(pipeline, "OUTPUT", outputs), \
+                    patch.object(pipeline, "require_tool"), \
+                    patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 60, "local": False}), \
+                    patch.object(pipeline, "acquire", return_value=downloaded) as acquire, \
+                    patch.object(pipeline, "render_short", side_effect=lambda source, path, *args: path.write_bytes(b"short")), \
+                    patch("builtins.print"):
+                pipeline.main()
+            acquire.assert_called_once_with("https://example.invalid/video", "source", metadata_validated=True)
+
+    def test_failure_names_output_cleans_partial_and_skips_upload(self):
+        root, _, _, _, _, upload, error = self.run_cli(
+            "both", ["--short-clip", "1-5", "--upload"], long_error=True)
+        self.assertRegex(str(error), "Long-form output failed")
+        upload.assert_not_called()
+        self.assertFalse((root / "output/source_16x9.mp4").exists())
+
+    def test_shorts_failure_names_output_cleans_partial_and_skips_upload(self):
+        root, _, _, _, _, upload, error = self.run_cli(
+            "both", ["--short-clip", "1-5", "--upload"], short_error=True)
+        self.assertRegex(str(error), "Shorts output failed")
+        upload.assert_not_called()
+        self.assertFalse((root / "output/source_short_01.mp4").exists())
+
+    def test_existing_modes_still_accept_their_original_range_options(self):
+        *_, shorts_error = self.run_cli("shorts", ["--clip", "1-5"])
+        self.assertIsNone(shorts_error)
+        *_, long_error = self.run_cli("long", ["--start", "1", "--end", "5"])
+        self.assertIsNone(long_error)
 
 
 if __name__ == "__main__":

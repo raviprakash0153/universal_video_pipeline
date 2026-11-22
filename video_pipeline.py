@@ -57,13 +57,14 @@ def get_info(source: str) -> dict:
             "uploader": data.get("uploader") or data.get("channel") or None,
             "duration": float(data.get("duration") or 0), "local": False}
 
-def acquire(source: str, title: str) -> Path:
+def acquire(source: str, title: str, *, metadata_validated: bool = False) -> Path:
     if Path(source).exists():
         return Path(source).resolve()
     target = WORK / f"{safe_name(title)}.%(ext)s"
-    metadata = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
-                    "--dump-single-json", "--no-download", source], capture=True)
-    validate_video_formats(json.loads(metadata.stdout))
+    if not metadata_validated:
+        metadata = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
+                        "--dump-single-json", "--no-download", source], capture=True)
+        validate_video_formats(json.loads(metadata.stdout))
     run(["yt-dlp", "--no-warnings", "--no-playlist",
          "-f", quality_format_selector(),
          "--merge-output-format", "mp4", "-o", str(target), source])
@@ -92,6 +93,30 @@ def validate_range(start: float, end: float, duration: float | None = None):
         raise ValueError("Clip range must use finite, non-negative times with end after start.")
     if duration is not None and end > duration:
         raise ValueError("Clip end is after source duration.")
+
+def automatic_clip_ranges(duration: float, count: int, clip_length: float) -> list[tuple[float, float]]:
+    """Plan distinct, evenly distributed clip windows for Shorts."""
+    if count <= 0 or clip_length <= 0:
+        raise ValueError("--auto-clips and --clip-length must be positive.")
+    # A one second minimum gives a practical lower bound for a valid generated clip.
+    if not math.isfinite(duration) or duration < count:
+        raise ValueError(
+            f"Source duration ({duration:g}s) is too short for {count} clips; "
+            "at least one second per clip is required."
+        )
+    width = min(float(clip_length), duration / count)
+    if count == 1:
+        starts = [(duration - width) / 2]
+    else:
+        # Place window centers evenly from the beginning to the end of the source.
+        centers = [duration * i / (count - 1) for i in range(count)]
+        starts = [min(max(center - width / 2, 0), duration - width) for center in centers]
+    ranges = [(start, start + width) for start in starts]
+    for start, end in ranges:
+        validate_range(start, end, duration)
+    if len(set(ranges)) != count:
+        raise ValueError(f"Source duration is too short to create {count} distinct clips.")
+    return ranges
 
 def ensure_outputs_available(paths):
     existing = [str(path) for path in paths if path.exists()]
@@ -345,11 +370,14 @@ def upload_youtube(path: Path, title: str, description: str, privacy: str, clien
 
 def main():
     parser = argparse.ArgumentParser(description="Portable Shorts + Long-form video production")
-    parser.add_argument("mode", choices=["shorts", "long"])
+    parser.add_argument("mode", choices=["shorts", "long", "both"])
     parser.add_argument("--source", required=True, help="YouTube URL or local video path")
     parser.add_argument("--start", type=parse_time, default=None, help="Start timestamp, e.g. 00:02:10")
     parser.add_argument("--end", type=parse_time, default=None, help="End timestamp, e.g. 00:02:45")
     parser.add_argument("--clip", action="append", default=[], help="Short clip range START-END; repeat for multiple clips")
+    parser.add_argument("--short-clip", action="append", default=[], help="Shorts range for both mode; repeatable START-END")
+    parser.add_argument("--long-start", type=parse_time, default=None, help="Long-form start time in both mode")
+    parser.add_argument("--long-end", type=parse_time, default=None, help="Long-form end time in both mode")
     parser.add_argument("--auto-clips", type=int, default=0, help="Create N evenly spaced candidate clips (not AI viral detection)")
     parser.add_argument("--clip-length", type=int, default=35)
     parser.add_argument("--whisper-model", default="tiny", choices=["tiny", "base", "small", "medium"])
@@ -376,14 +404,26 @@ def main():
     if not math.isfinite(info["duration"]) or info["duration"] <= 0:
         raise SystemExit("Source duration must be a positive finite number.")
     print(f"Source: {info['title']} | duration: {info['duration']:.1f}s")
-    source = acquire(args.source, info["title"])
     stem = safe_name(args.title or info["title"])
     subtitle_model = None if args.no_subtitles else args.whisper_model
 
+    long_start = args.long_start if args.mode == "both" and args.long_start is not None else args.start
+    long_end = args.long_end if args.mode == "both" and args.long_end is not None else args.end
+    if args.mode in ("long", "both"):
+        long_start = long_start or 0.0
+        if long_start >= info["duration"] or (long_end is not None and long_end > info["duration"]):
+            raise SystemExit("Requested range is outside the source duration.")
+        if long_end is not None:
+            try:
+                validate_range(long_start, long_end, info["duration"])
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+
     outputs = []
-    if args.mode == "shorts":
+    if args.mode in ("shorts", "both"):
         ranges = []
-        for item in args.clip:
+        short_items = args.short_clip if args.mode == "both" and args.short_clip else args.clip
+        for item in short_items:
             if "-" not in item:
                 raise SystemExit("--clip must be START-END, for example 00:01:00-00:01:35")
             a, b = item.split("-", 1)
@@ -392,15 +432,14 @@ def main():
             length = args.clip_length
             if args.auto_clips < 0 or length <= 0:
                 raise SystemExit("--auto-clips and --clip-length must be positive.")
-            if info["duration"] <= length:
-                ranges = [(0, info["duration"])]
-            else:
-                # Evenly spaced candidates; inspect them before publishing.
-                starts = [int((i+1) * (info["duration"]-length) / (args.auto_clips+1))
-                          for i in range(args.auto_clips)]
-                ranges = [(s, min(s+length, info["duration"])) for s in starts]
-        if not ranges and args.start is not None and args.end is not None:
+            try:
+                ranges = automatic_clip_ranges(info["duration"], args.auto_clips, length)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        if not ranges and args.mode == "shorts" and args.start is not None and args.end is not None:
             ranges = [(args.start, args.end)]
+        if not ranges and args.mode == "both":
+            raise SystemExit("For both mode, provide --short-clip START-END or --auto-clips N.")
         if not ranges:
             raise SystemExit("For Shorts, provide --clip START-END (repeatable), or --auto-clips N.")
         try:
@@ -409,28 +448,34 @@ def main():
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         planned = [OUTPUT / f"{stem}_short_{i:02d}.mp4" for i in range(1, len(ranges) + 1)]
-        ensure_outputs_available(planned)
+        long_output = OUTPUT / f"{stem}_16x9.mp4"
+        ensure_outputs_available(planned + ([long_output] if args.mode == "both" else []))
+        source = acquire(args.source, info["title"], metadata_validated=True)
         for i, (a, b) in enumerate(ranges, 1):
             out = planned[i - 1]
             banner_title = args.title or info.get("title")
             banner_channel = info.get("uploader") or args.channel_name
-            render_short(source, out, a, b, subtitle_model, args.banner,
-                         banner_title, banner_channel)
-            outputs.append(out)
-    else:
-        out = OUTPUT / f"{stem}_16x9.mp4"
-        ensure_outputs_available([out])
-        start = args.start or 0.0
-        if start >= info["duration"] or (args.end is not None and args.end > info["duration"]):
-            raise SystemExit("Requested range is outside the source duration.")
-        if args.end is not None:
             try:
-                validate_range(start, args.end, info["duration"])
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from exc
-        render_long(source, out, start, args.end, args.brightness, args.contrast,
+                render_short(source, out, a, b, subtitle_model, args.banner,
+                             banner_title, banner_channel)
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                raise RuntimeError(f"Shorts output failed ({out}): {exc}") from exc
+            outputs.append(out)
+    if args.mode in ("long", "both"):
+        out = OUTPUT / f"{stem}_16x9.mp4"
+        if args.mode == "long":
+            ensure_outputs_available([out])
+            source = acquire(args.source, info["title"], metadata_validated=True)
+        start = long_start
+        end_arg = long_end
+        try:
+            render_long(source, out, start, end_arg, args.brightness, args.contrast,
                     args.saturation, args.volume, args.bass_gain, args.banner,
                     args.title or info.get("title"), info.get("uploader") or args.channel_name)
+        except Exception as exc:
+            out.unlink(missing_ok=True)
+            raise RuntimeError(f"Long-form output failed ({out}): {exc}") from exc
         outputs.append(out)
 
     print("\nFinished files:")
