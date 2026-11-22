@@ -214,7 +214,8 @@ def verify(path: Path):
     data = json.loads(result.stdout)
     print("OUTPUT CHECK:", data.get("streams", []))
 
-def upload_youtube(path: Path, title: str, description: str, privacy: str, client_file: Path):
+def upload_youtube(path: Path, title: str, description: str, privacy: str, client_file: Path,
+                   tags: list[str] | None = None, category_id: str = "22"):
     try:
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
@@ -236,8 +237,11 @@ def upload_youtube(path: Path, title: str, description: str, privacy: str, clien
             creds = flow.run_local_server(port=0)
         token_file.write_text(creds.to_json(), encoding="utf-8")
     youtube = build("youtube", "v3", credentials=creds)
-    body = {"snippet": {"title": title[:100], "description": description,
-                        "categoryId": "22"},
+    snippet = {"title": title[:100], "description": description,
+               "categoryId": category_id}
+    if tags:
+        snippet["tags"] = tags
+    body = {"snippet": snippet,
             "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}}
     media = MediaFileUpload(str(path), chunksize=8*1024*1024, resumable=True)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
@@ -264,6 +268,8 @@ def main():
     parser.add_argument("--title", default=None)
     parser.add_argument("--description", default="")
     parser.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
+    parser.add_argument("--tag", action="append", default=[], help="Video tag; repeat to add multiple tags")
+    parser.add_argument("--category-id", default="22", help="YouTube category ID (default: 22)")
     args = parser.parse_args()
 
     require_tool("ffmpeg")
@@ -332,7 +338,8 @@ def main():
         if not client_file.exists():
             raise SystemExit("OAuth client JSON not found. Create a new Desktop App OAuth client and pass --client-secrets.")
         for p in outputs:
-            upload_youtube(p, args.title or p.stem, args.description, args.privacy, client_file)
+            upload_youtube(p, args.title or p.stem, args.description, args.privacy, client_file,
+                           tags=args.tag, category_id=args.category_id)
 
 if __name__ == "__main__":
     main()
