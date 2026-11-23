@@ -50,6 +50,7 @@ def get_video_info(url: str):
     raise ValueError("Could not extract video metadata.")
 
 def process_long_video(url: str, start_time: str = "00:12:00", end_time: str = "00:23:30", custom_title: str = None):
+    raise RuntimeError("Legacy direct publishing is disabled; use the individually approved private publishing flow.")
     print("=======================================================")
     print("🎬 Long-Form 16:9 Full Screen YouTube Video Pipeline")
     print(f"   URL: {url}")

@@ -17,9 +17,17 @@ import subprocess
 import sys
 import math
 import tempfile
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
-from source_video_quality import quality_format_selector, validate_video_formats
+from source_video_quality import quality_format_selector, validate_video_formats, yt_dlp_runtime_options
+from timestamp_validation import valid_word_timestamps
+from safety_foundations import resolve_local_input, probe_video, enforce_reuse_rights, validate_approval
+from pipeline_store import (connect as connect_lifecycle, create_job as lifecycle_create_job,
+                            record_provenance, register_asset, create_platform_output,
+                            set_job_status, decide_approval, validate_db_approval,
+                            record_validation)
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "output"
@@ -27,6 +35,19 @@ WORK = ROOT / "work"
 TITLE_BANNER_FONT = Path("/System/Library/Fonts/Geneva.ttf")
 OUTPUT.mkdir(exist_ok=True)
 WORK.mkdir(exist_ok=True)
+
+
+@dataclass
+class VideoPipelineResult:
+    """Files and optional YouTube metadata produced by one pipeline run."""
+    output_paths: list[Path] = field(default_factory=list)
+    youtube_video_ids: list[str] = field(default_factory=list)
+    youtube_urls: list[str] = field(default_factory=list)
+
+    @property
+    def outputs(self) -> list[Path]:
+        """Compatibility-friendly short name for generated output paths."""
+        return self.output_paths
 
 def run(cmd: list[str], *, capture=False):
     print("+", " ".join(str(x) for x in cmd))
@@ -44,12 +65,15 @@ def safe_name(value: str) -> str:
 
 def get_info(source: str) -> dict:
     if Path(source).exists():
-        p = Path(source).resolve()
+        resolved = resolve_local_input(source)
+        p = Path(resolved["path"])
         probe = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                      "-of", "json", str(p)], capture=True)
         duration = float(json.loads(probe.stdout)["format"]["duration"])
-        return {"title": p.stem, "uploader": None, "duration": duration, "local": True}
-    result = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
+        return {"title": p.stem, "uploader": None, "duration": duration, "local": True,
+                "width": resolved["width"], "height": resolved["height"],
+                "orientation": resolved["orientation"]}
+    result = run(["yt-dlp", *yt_dlp_runtime_options(), "--no-warnings", "--format", quality_format_selector(),
                   "--dump-single-json", "--no-download", source], capture=True)
     data = json.loads(result.stdout)
     validate_video_formats(data)
@@ -62,16 +86,20 @@ def acquire(source: str, title: str, *, metadata_validated: bool = False) -> Pat
         return Path(source).resolve()
     target = WORK / f"{safe_name(title)}.%(ext)s"
     if not metadata_validated:
-        metadata = run(["yt-dlp", "--no-warnings", "--format", quality_format_selector(),
+        metadata = run(["yt-dlp", *yt_dlp_runtime_options(), "--no-warnings", "--format", quality_format_selector(),
                         "--dump-single-json", "--no-download", source], capture=True)
         validate_video_formats(json.loads(metadata.stdout))
-    run(["yt-dlp", "--no-warnings", "--no-playlist",
+    run(["yt-dlp", *yt_dlp_runtime_options(), "--no-warnings", "--no-playlist",
          "-f", quality_format_selector(),
          "--merge-output-format", "mp4", "-o", str(target), source])
     matches = sorted(WORK.glob(f"{safe_name(title)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not matches:
         raise RuntimeError("yt-dlp finished but the downloaded file was not found.")
-    return matches[0]
+    resolved = matches[0]
+    # Metadata preflight can be stale or differ from the merged download. Probe the
+    # actual bytes before they enter any edit/render stage.
+    probe_video(resolved)
+    return resolved
 
 def parse_time(value: str) -> float:
     bits = value.split(":")
@@ -126,7 +154,7 @@ def ensure_outputs_available(paths):
 def ff_time(seconds: float) -> str:
     return f"{seconds:.3f}"
 
-def transcribe(video: Path, model_name: str):
+def transcribe(video: Path, model_name: str, language: str | None = None):
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -134,14 +162,30 @@ def transcribe(video: Path, model_name: str):
         return []
     # Intel Mac / CPU-safe defaults. Change model to small/medium if the machine has enough RAM.
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(str(video), word_timestamps=True, vad_filter=True)
+    options = {"word_timestamps": True, "vad_filter": True, "beam_size": 5}
+    if language is not None:
+        if language not in {"hi", "en"}:
+            raise ValueError("Transcription language must be 'hi', 'en', or None for automatic detection.")
+        options["language"] = language
+    segments, _ = model.transcribe(str(video), **options)
     words = []
     for segment in segments:
         if segment.words:
             for word in segment.words:
-                token = re.sub(r"^[^\w]+|[^\w]+$", "", word.word, flags=re.UNICODE).upper()
+                token = str(getattr(word, "word", "")).strip()
                 if token:
-                    words.append((float(word.start), max(float(word.end), float(word.start) + 0.12), token))
+                    timestamps = valid_word_timestamps(getattr(word, "start", None), getattr(word, "end", None), token)
+                    if timestamps is None:
+                        continue
+                    start, end = timestamps
+                    words.append((start, end, token))
+    # Surface alignment and script anomalies for review while preserving the model output.
+    try:
+        from viral_moment_analyzer import transcription_quality_issues
+        for issue in transcription_quality_issues(words):
+            print(f"Transcription quality warning: {issue}")
+    except ImportError:
+        pass
     return words
 
 def ass_timestamp(seconds: float) -> str:
@@ -150,7 +194,10 @@ def ass_timestamp(seconds: float) -> str:
     s = seconds % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
-def write_ass(words, path: Path, width: int, height: int, font_size: int, y: int):
+def write_ass(words, path: Path, width: int, height: int, font_size: int, y: int,
+              caption_language: str = "original"):
+    from hinglish import caption_words
+    words = caption_words(words, caption_language)
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -211,7 +258,8 @@ def banner_filter(width: int, height: int, title: str, channel: str, directory: 
     )
 
 def render_short(source: Path, output: Path, start: float, end: float, subtitle_model: str | None,
-                 banner: bool = False, title: str | None = None, channel: str | None = None):
+                 banner: bool = False, title: str | None = None, channel: str | None = None,
+                 whisper_language: str | None = None, caption_language: str = "original"):
     validate_range(start, end)
     duration = end - start
     temp = WORK / f"{output.stem}_trim.mp4"
@@ -223,7 +271,7 @@ def render_short(source: Path, output: Path, start: float, end: float, subtitle_
              "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
              "-c:a", "aac", "-b:a", "160k", "-avoid_negative_ts", "make_zero", str(temp)])
-        words = transcribe(temp, subtitle_model) if subtitle_model else []
+        words = transcribe(temp, subtitle_model, language=whisper_language) if subtitle_model else []
         # 9:16 background plus centered horizontal foreground.
         filters = (
             "[0:v]setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -238,7 +286,7 @@ def render_short(source: Path, output: Path, start: float, end: float, subtitle_
                 filters += f";[v0]{banner_filters}[v0b]"
                 base_video = "[v0b]"
                 if words:
-                    write_ass(words, ass, 1080, 1920, 64, 1370)
+                    write_ass(words, ass, 1080, 1920, 64, 1370, caption_language)
                     filters += f";{base_video}ass='{escape_filter_path(ass)}'[v]"
                     vmap = "[v]"
                 else:
@@ -246,7 +294,7 @@ def render_short(source: Path, output: Path, start: float, end: float, subtitle_
                 _render_short_output(temp, output, filters, vmap)
         else:
             if words:
-                write_ass(words, ass, 1080, 1920, 64, 1370)
+                write_ass(words, ass, 1080, 1920, 64, 1370, caption_language)
                 filters += f";[v0]ass='{escape_filter_path(ass)}'[v]"
                 vmap = "[v]"
             else:
@@ -366,7 +414,200 @@ def upload_youtube(path: Path, title: str, description: str, privacy: str, clien
         status, response = request.next_chunk()
         if status:
             print(f"Upload progress: {int(status.progress()*100)}%")
-    print("Uploaded:", "https://youtu.be/" + response["id"])
+    video_id = response["id"]
+    url = "https://youtu.be/" + video_id
+    print("Uploaded:", url)
+    return {"video_id": video_id, "url": url}
+
+
+def process_video(*, mode: str, source: str, start: float | None = None,
+                  end: float | None = None, clip: list[str] | None = None,
+                  short_clip: list[str] | None = None, long_start: float | None = None,
+                  long_end: float | None = None, auto_clips: int = 0,
+                  clip_length: int = 35, whisper_model: str = "small",
+                  no_subtitles: bool = False, upload: bool = False,
+                  client_secrets: str | Path = ROOT / "client_secret.json",
+                  title: str | None = None, banner: bool = False,
+                  channel_name: str | None = None, description: str = "",
+                  privacy: str = "private", tag: list[str] | None = None,
+                  category_id: str = "22", brightness: float = 0,
+                  contrast: float = 1.03, saturation: float = 1.05,
+                  volume: float = 1.0, bass_gain: float = 0,
+                  whisper_language: str | None = None,
+                  caption_language: str = "original",
+                  rights_state: str = "unknown", approval_files: list[str | Path] | None = None,
+                  progress_callback=None) -> VideoPipelineResult:
+    """Process a source into the requested Shorts and/or long-form outputs."""
+    if mode not in {"shorts", "long", "both"}:
+        raise ValueError("mode must be one of: shorts, long, both")
+    clip = list(clip or [])
+    short_clip = list(short_clip or [])
+    tag = list(tag or [])
+    result = VideoPipelineResult()
+
+    def progress(event: str, **details):
+        if progress_callback is not None:
+            progress_callback({"event": event, **details})
+
+    require_tool("ffmpeg")
+    require_tool("ffprobe")
+    # Creating clips/derivatives reuses source material even when the result is
+    # kept local. Unknown rights therefore stop the job before source intake.
+    enforce_reuse_rights(rights_state)
+    info = get_info(source)
+    if not math.isfinite(info["duration"]) or info["duration"] <= 0:
+        raise SystemExit("Source duration must be a positive finite number.")
+    print(f"Source: {info['title']} | duration: {info['duration']:.1f}s")
+    job_id = str(uuid.uuid4())
+    lifecycle_db = connect_lifecycle()
+    lifecycle_create_job(lifecycle_db, job_id, source,
+                         rights_state=getattr(rights_state, "value", rights_state),
+                         metadata={"source_title": info["title"], "source_duration": info["duration"]})
+    record_provenance(lifecycle_db, job_id, source,
+                      "url" if source.startswith(("http://", "https://")) else "local")
+    set_job_status(lifecycle_db, job_id, "processing")
+    stem = safe_name(title or info["title"])
+    subtitle_model = None if no_subtitles else whisper_model
+
+    resolved_long_start = long_start if mode == "both" and long_start is not None else start
+    resolved_long_end = long_end if mode == "both" and long_end is not None else end
+    if mode in ("long", "both"):
+        resolved_long_start = resolved_long_start or 0.0
+        if resolved_long_start >= info["duration"] or (resolved_long_end is not None and resolved_long_end > info["duration"]):
+            raise SystemExit("Requested range is outside the source duration.")
+        if resolved_long_end is not None:
+            try:
+                validate_range(resolved_long_start, resolved_long_end, info["duration"])
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+
+    if mode in ("shorts", "both"):
+        ranges = []
+        short_items = short_clip if mode == "both" and short_clip else clip
+        for item in short_items:
+            if "-" not in item:
+                raise SystemExit("--clip must be START-END, for example 00:01:00-00:01:35")
+            a, b = item.split("-", 1)
+            ranges.append((parse_time(a), parse_time(b)))
+        if not ranges and auto_clips:
+            if auto_clips < 0 or clip_length <= 0:
+                raise SystemExit("--auto-clips and --clip-length must be positive.")
+            try:
+                ranges = automatic_clip_ranges(info["duration"], auto_clips, clip_length)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        if not ranges and mode == "shorts" and start is not None and end is not None:
+            ranges = [(start, end)]
+        if not ranges and mode == "both":
+            raise SystemExit("For both mode, provide --short-clip START-END or --auto-clips N.")
+        if not ranges:
+            raise SystemExit("For Shorts, provide --clip START-END (repeatable), or --auto-clips N.")
+        try:
+            for a, b in ranges:
+                validate_range(a, b, info["duration"])
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        planned = [OUTPUT / f"{stem}_short_{i:02d}.mp4" for i in range(1, len(ranges) + 1)]
+        long_output = OUTPUT / f"{stem}_16x9.mp4"
+        ensure_outputs_available(planned + ([long_output] if mode == "both" else []))
+        acquired = acquire(source, info["title"], metadata_validated=True)
+        for i, (a, b) in enumerate(ranges, 1):
+            out = planned[i - 1]
+            progress("rendering", kind="short", index=i, total=len(ranges), output_path=out)
+            try:
+                render_args = (acquired, out, a, b, subtitle_model, banner,
+                               title or info.get("title"), info.get("uploader") or channel_name)
+                render_options = {}
+                if whisper_language is not None:
+                    render_options["whisper_language"] = whisper_language
+                if caption_language != "original":
+                    render_options["caption_language"] = caption_language
+                render_short(*render_args, **render_options)
+            except Exception as exc:
+                out.unlink(missing_ok=True)
+                raise RuntimeError(f"Shorts output failed ({out}): {exc}") from exc
+            result.output_paths.append(out)
+            progress("completed", kind="short", index=i, total=len(ranges), output_path=out)
+
+    if mode in ("long", "both"):
+        out = OUTPUT / f"{stem}_16x9.mp4"
+        if mode == "long":
+            ensure_outputs_available([out])
+            acquired = acquire(source, info["title"], metadata_validated=True)
+        progress("rendering", kind="long", index=1, total=1, output_path=out)
+        try:
+            render_long(acquired, out, resolved_long_start, resolved_long_end, brightness, contrast,
+                        saturation, volume, bass_gain, banner, title or info.get("title"),
+                        info.get("uploader") or channel_name)
+        except Exception as exc:
+            out.unlink(missing_ok=True)
+            raise RuntimeError(f"Long-form output failed ({out}): {exc}") from exc
+        result.output_paths.append(out)
+        progress("completed", kind="long", index=1, total=1, output_path=out)
+
+    print("\nFinished files:")
+    for path in result.output_paths:
+        print(f"  {path} ({path.stat().st_size/1024/1024:.1f} MB)")
+        metadata = {"media_file": str(path.resolve()), "title": title or path.stem,
+                    "description": description, "privacy": privacy, "tags": tag,
+                    "category_id": category_id, "platform": "youtube"}
+        asset_id = register_asset(lifecycle_db, job_id, path)
+        output_id = f"{job_id}:{path.stem}:youtube"
+        create_platform_output(lifecycle_db, output_id, job_id, "youtube", asset_id=asset_id,
+                               metadata=metadata)
+        record_validation(lifecycle_db, output_id, "passed", {"container": "mp4", "rendered_output": True})
+    set_job_status(lifecycle_db, job_id, "awaiting_approval")
+    if upload:
+        approvals = list(approval_files or [])
+        if len(approvals) != len(result.output_paths):
+            raise SystemExit("Publishing requires one individual approval file per output.")
+        client_file = Path(client_secrets).expanduser()
+        if not client_file.exists():
+            raise SystemExit("OAuth client JSON not found. Create a new Desktop App OAuth client and pass --client-secrets.")
+        for i, (path, approval_file) in enumerate(zip(result.output_paths, approvals), 1):
+            approval_metadata = {"media_file": str(path.resolve()), "title": title or path.stem,
+                                 "description": description, "privacy": privacy,
+                                 "tags": tag, "category_id": category_id,
+                                 "platform": "youtube"}
+            try:
+                validate_approval(approval_file, approval_metadata)
+                output_id = f"{job_id}:{path.stem}:youtube"
+                if Path(approval_file).is_file():
+                    approval_record = json.loads(Path(approval_file).read_text(encoding="utf-8"))
+                    decide_approval(lifecycle_db, output_id, True, approval_record["approver"])
+                    validate_db_approval(lifecycle_db, output_id)
+            except (ValueError, PermissionError, OSError, TypeError) as exc:
+                raise SystemExit(f"Publishing approval rejected for {path}: {exc}") from exc
+            progress("uploading", index=i, total=len(result.output_paths), output_path=path)
+            try:
+                uploaded = upload_youtube(path, title or path.stem, description, privacy, client_file,
+                                          tags=tag, category_id=category_id)
+            except Exception as exc:
+                with lifecycle_db:
+                    lifecycle_db.execute("INSERT INTO publishing_attempts VALUES(?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4()), output_id, "failed", None, None,
+                         json.dumps({"error_type": type(exc).__name__}),
+                         datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                    lifecycle_db.execute("UPDATE platform_outputs SET publishing_status='failed' WHERE output_id=?",
+                                         (output_id,))
+                raise
+            uploaded_record = uploaded if isinstance(uploaded, dict) else {}
+            with lifecycle_db:
+                lifecycle_db.execute("INSERT INTO publishing_attempts VALUES(?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), output_id, "succeeded" if uploaded else "failed",
+                     uploaded_record.get("video_id"), uploaded_record.get("url"), "{}",
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                lifecycle_db.execute("UPDATE platform_outputs SET publishing_status=?,platform_post_id=?,platform_post_url=? WHERE output_id=?",
+                    ("succeeded" if uploaded else "failed", uploaded_record.get("video_id"),
+                     uploaded_record.get("url"), output_id))
+            if uploaded_record.get("video_id"):
+                result.youtube_video_ids.append(uploaded_record["video_id"])
+                result.youtube_urls.append(uploaded_record["url"])
+            progress("uploaded", index=i, total=len(result.output_paths), output_path=path,
+                     video_id=uploaded_record.get("video_id"), url=uploaded_record.get("url"))
+    set_job_status(lifecycle_db, job_id, "completed")
+    lifecycle_db.close()
+    return result
 
 def main():
     parser = argparse.ArgumentParser(description="Portable Shorts + Long-form video production")
@@ -380,9 +621,14 @@ def main():
     parser.add_argument("--long-end", type=parse_time, default=None, help="Long-form end time in both mode")
     parser.add_argument("--auto-clips", type=int, default=0, help="Create N evenly spaced candidate clips (not AI viral detection)")
     parser.add_argument("--clip-length", type=int, default=35)
-    parser.add_argument("--whisper-model", default="tiny", choices=["tiny", "base", "small", "medium"])
+    parser.add_argument("--whisper-model", default="small", choices=["tiny", "base", "small", "medium"])
+    parser.add_argument("--whisper-language", choices=["hi", "en"], default=None,
+                        help="Force Hindi (hi) or English (en); default is automatic detection for code-switching.")
+    parser.add_argument("--caption-language", choices=["original", "hinglish"], default="original")
     parser.add_argument("--no-subtitles", action="store_true")
     parser.add_argument("--upload", action="store_true")
+    parser.add_argument("--rights-state", choices=["unknown", "owned", "licensed", "permission_granted", "public_domain", "prohibited"], default="unknown")
+    parser.add_argument("--approval-file", action="append", default=[], help="Individual JSON approval, one per output; binds SHA-256 and metadata")
     parser.add_argument("--client-secrets", default=str(ROOT / "client_secret.json"))
     parser.add_argument("--title", default=None)
     parser.add_argument("--banner", action="store_true", help="Render an optional title and channel lower-third")
@@ -397,97 +643,19 @@ def main():
     parser.add_argument("--volume", type=bounded_number(0, 10, "Volume"), default=1.0)
     parser.add_argument("--bass-gain", type=bounded_number(-20, 20, "Bass gain"), default=0)
     args = parser.parse_args()
-
-    require_tool("ffmpeg")
-    require_tool("ffprobe")
-    info = get_info(args.source)
-    if not math.isfinite(info["duration"]) or info["duration"] <= 0:
-        raise SystemExit("Source duration must be a positive finite number.")
-    print(f"Source: {info['title']} | duration: {info['duration']:.1f}s")
-    stem = safe_name(args.title or info["title"])
-    subtitle_model = None if args.no_subtitles else args.whisper_model
-
-    long_start = args.long_start if args.mode == "both" and args.long_start is not None else args.start
-    long_end = args.long_end if args.mode == "both" and args.long_end is not None else args.end
-    if args.mode in ("long", "both"):
-        long_start = long_start or 0.0
-        if long_start >= info["duration"] or (long_end is not None and long_end > info["duration"]):
-            raise SystemExit("Requested range is outside the source duration.")
-        if long_end is not None:
-            try:
-                validate_range(long_start, long_end, info["duration"])
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from exc
-
-    outputs = []
-    if args.mode in ("shorts", "both"):
-        ranges = []
-        short_items = args.short_clip if args.mode == "both" and args.short_clip else args.clip
-        for item in short_items:
-            if "-" not in item:
-                raise SystemExit("--clip must be START-END, for example 00:01:00-00:01:35")
-            a, b = item.split("-", 1)
-            ranges.append((parse_time(a), parse_time(b)))
-        if not ranges and args.auto_clips:
-            length = args.clip_length
-            if args.auto_clips < 0 or length <= 0:
-                raise SystemExit("--auto-clips and --clip-length must be positive.")
-            try:
-                ranges = automatic_clip_ranges(info["duration"], args.auto_clips, length)
-            except ValueError as exc:
-                raise SystemExit(str(exc)) from exc
-        if not ranges and args.mode == "shorts" and args.start is not None and args.end is not None:
-            ranges = [(args.start, args.end)]
-        if not ranges and args.mode == "both":
-            raise SystemExit("For both mode, provide --short-clip START-END or --auto-clips N.")
-        if not ranges:
-            raise SystemExit("For Shorts, provide --clip START-END (repeatable), or --auto-clips N.")
-        try:
-            for a, b in ranges:
-                validate_range(a, b, info["duration"])
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
-        planned = [OUTPUT / f"{stem}_short_{i:02d}.mp4" for i in range(1, len(ranges) + 1)]
-        long_output = OUTPUT / f"{stem}_16x9.mp4"
-        ensure_outputs_available(planned + ([long_output] if args.mode == "both" else []))
-        source = acquire(args.source, info["title"], metadata_validated=True)
-        for i, (a, b) in enumerate(ranges, 1):
-            out = planned[i - 1]
-            banner_title = args.title or info.get("title")
-            banner_channel = info.get("uploader") or args.channel_name
-            try:
-                render_short(source, out, a, b, subtitle_model, args.banner,
-                             banner_title, banner_channel)
-            except Exception as exc:
-                out.unlink(missing_ok=True)
-                raise RuntimeError(f"Shorts output failed ({out}): {exc}") from exc
-            outputs.append(out)
-    if args.mode in ("long", "both"):
-        out = OUTPUT / f"{stem}_16x9.mp4"
-        if args.mode == "long":
-            ensure_outputs_available([out])
-            source = acquire(args.source, info["title"], metadata_validated=True)
-        start = long_start
-        end_arg = long_end
-        try:
-            render_long(source, out, start, end_arg, args.brightness, args.contrast,
-                    args.saturation, args.volume, args.bass_gain, args.banner,
-                    args.title or info.get("title"), info.get("uploader") or args.channel_name)
-        except Exception as exc:
-            out.unlink(missing_ok=True)
-            raise RuntimeError(f"Long-form output failed ({out}): {exc}") from exc
-        outputs.append(out)
-
-    print("\nFinished files:")
-    for p in outputs:
-        print(f"  {p} ({p.stat().st_size/1024/1024:.1f} MB)")
-    if args.upload:
-        client_file = Path(args.client_secrets).expanduser()
-        if not client_file.exists():
-            raise SystemExit("OAuth client JSON not found. Create a new Desktop App OAuth client and pass --client-secrets.")
-        for p in outputs:
-            upload_youtube(p, args.title or p.stem, args.description, args.privacy, client_file,
-                           tags=args.tag, category_id=args.category_id)
+    return process_video(
+        mode=args.mode, source=args.source, start=args.start, end=args.end,
+        clip=args.clip, short_clip=args.short_clip, long_start=args.long_start,
+        long_end=args.long_end, auto_clips=args.auto_clips, clip_length=args.clip_length,
+        whisper_model=args.whisper_model, no_subtitles=args.no_subtitles,
+        whisper_language=args.whisper_language,
+        caption_language=args.caption_language,
+        upload=args.upload, client_secrets=args.client_secrets, title=args.title,
+        banner=args.banner, channel_name=args.channel_name, description=args.description,
+        privacy=args.privacy, tag=args.tag, category_id=args.category_id,
+        rights_state=args.rights_state, approval_files=args.approval_file,
+        brightness=args.brightness, contrast=args.contrast, saturation=args.saturation,
+        volume=args.volume, bass_gain=args.bass_gain)
 
 if __name__ == "__main__":
     main()

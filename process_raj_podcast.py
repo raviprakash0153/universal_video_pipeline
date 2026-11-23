@@ -14,6 +14,7 @@ import json
 import argparse
 from faster_whisper import WhisperModel
 from source_video_quality import quality_format_selector, validate_video_formats
+from timestamp_validation import valid_word_timestamps
 
 NODE_PATH = "/Users/raviprakash/.nvm/versions/node/v22.17.1/bin/node"
 FONTS_DIR = "/System/Library/Fonts/Supplemental"
@@ -92,7 +93,7 @@ def clean_word(w: str) -> str:
     w = re.sub(r'^[^\w]+|[^\w]+$', '', w)
     return w.upper()
 
-def generate_ass_subtitles(words, ass_filename: str):
+def generate_ass_subtitles(words, ass_filename: str, caption_language: str = "original"):
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -106,11 +107,19 @@ Style: Hormozi,Impact,70,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,10
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    from hinglish import to_hinglish
+    if caption_language not in {"original", "hinglish"}:
+        raise ValueError("caption language must be 'original' or 'hinglish'")
     valid_words = []
     for w in words:
-        cw = clean_word(w.word)
+        token = str(getattr(w, "word", ""))
+        timestamps = valid_word_timestamps(getattr(w, "start", None), getattr(w, "end", None), token)
+        if timestamps is None:
+            continue
+        display_token = to_hinglish(token) if caption_language == "hinglish" else token
+        cw = display_token.strip() if caption_language == "hinglish" else clean_word(display_token)
         if cw and len(cw) > 0 and not cw.startswith('.'):
-            valid_words.append((w.start, w.end, cw))
+            valid_words.append((*timestamps, cw))
 
     events = []
     if not valid_words:
@@ -128,13 +137,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         line_parts.append(text)
                 line_text = " ".join(line_parts)
                 start_str = format_ass_time(w_start)
-                end_str = format_ass_time(max(w_end, w_start + 0.25))
+                end_str = format_ass_time(w_end)
                 events.append(f"Dialogue: 0,{start_str},{end_str},Hormozi,,0,0,0,,{{\\pos(540,1150)}}{line_text}")
 
     with open(ass_filename, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events) + "\n")
 
-def process_podcast_clip(clip_info: dict, model: WhisperModel):
+def process_podcast_clip(clip_info: dict, model: WhisperModel, language: str | None = None,
+                         caption_language: str = "original"):
     raw_file = os.path.join(WORKSPACE_DIR, f"raj_raw_{clip_info['id']}.mp4")
     ass_file = os.path.join(WORKSPACE_DIR, f"raj_sub_{clip_info['id']}.ass")
     output_file = os.path.join(WORKSPACE_DIR, f"viral_short_{clip_info['id']}.mp4")
@@ -171,13 +181,16 @@ def process_podcast_clip(clip_info: dict, model: WhisperModel):
 
     # 2. Transcribe with Whisper
     print("▶ Step 2: Transcribing speech with faster-whisper...")
-    segments, _ = model.transcribe(raw_file, word_timestamps=True)
+    options = {"word_timestamps": True, "beam_size": 5}
+    if language is not None:
+        options["language"] = language
+    segments, _ = model.transcribe(raw_file, **options)
     all_words = []
     for s in segments:
         if s.words:
             all_words.extend(s.words)
     print(f"   Detected {len(all_words)} words in audio.")
-    generate_ass_subtitles(all_words, ass_file)
+    generate_ass_subtitles(all_words, ass_file, caption_language)
 
     # 3. Clean Podcast Framing Formula (1080x1920)
     # Background: blurred fill
@@ -215,7 +228,7 @@ def process_podcast_clip(clip_info: dict, model: WhisperModel):
         "title": clip_info["title"],
         "description": clip_info["description"],
         "tags": clip_info["tags"],
-        "privacy": "public",
+        "privacy": "private",
         "scheduled_slot": clip_info["slot"]
     }
     manifest_path = os.path.join(QUEUE_DIR, f"queue_slot_{clip_info['id']}.json")
@@ -231,16 +244,22 @@ def process_podcast_clip(clip_info: dict, model: WhisperModel):
                 pass
 
 def main():
+    parser = argparse.ArgumentParser(description="Render Raj Shamani podcast clips")
+    parser.add_argument("--whisper-model", default="small", choices=["tiny", "base", "small", "medium"])
+    parser.add_argument("--whisper-language", choices=["hi", "en"], default=None)
+    parser.add_argument("--caption-language", choices=["original", "hinglish"], default="original")
+    args = parser.parse_args()
     print("=======================================================")
     print("🎙️ Processing Raj Shamani Podcast Viral Clips (1080p)")
     print(f"   URL: {VIDEO_URL}")
     print("=======================================================")
 
-    print("Loading faster-whisper model (tiny, int8 CPU)...")
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    print(f"Loading faster-whisper model ({args.whisper_model}, int8 CPU)...")
+    model = WhisperModel(args.whisper_model, device="cpu", compute_type="int8")
 
     for clip in CLIPS:
-        process_podcast_clip(clip, model)
+        process_podcast_clip(clip, model, language=args.whisper_language,
+                             caption_language=args.caption_language)
 
     print("\n=======================================================")
     print("✅ All 3 Raj Shamani Viral Shorts Rendered & Queued!")

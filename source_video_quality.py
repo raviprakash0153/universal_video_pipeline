@@ -6,6 +6,11 @@ import subprocess
 MIN_HEIGHT = 720
 
 
+def yt_dlp_runtime_options() -> list[str]:
+    """Use yt-dlp's Node runtime discovery through the current PATH."""
+    return ["--js-runtimes", "node"]
+
+
 def quality_format_selector() -> str:
     """Select the best eligible video with the best audio, or a combined format."""
     return (

@@ -4,6 +4,8 @@ import tempfile
 import types
 import unittest
 import unittest.mock
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +14,65 @@ import source_video_quality as quality
 
 
 class InputValidationTests(unittest.TestCase):
+    def test_transcribe_discards_invalid_timestamps_and_preserves_valid_boundaries(self):
+        cases = [
+            (None, 1), ("bad", 2), ("1:2", 2), (float("nan"), 2),
+            (1, float("inf")), (-1, 2), (3, 2), (2, 2),
+        ]
+
+        class FakeModel:
+            def transcribe(self, path, **options):
+                entries = [types.SimpleNamespace(word=" original ", start=1.23456789, end=1.23456799)]
+                entries.extend(types.SimpleNamespace(word=" unchanged ", start=start, end=end) for start, end in cases)
+                entries.append(types.SimpleNamespace(word=" long ", start=40, end=80))
+                entries.append(types.SimpleNamespace(word=" missing "))
+                return ([types.SimpleNamespace(words=entries)], None)
+
+        module = types.SimpleNamespace(WhisperModel=lambda *args, **kwargs: FakeModel())
+        output = io.StringIO()
+        with patch.dict(sys.modules, {"faster_whisper": module}), redirect_stdout(output):
+            words = pipeline.transcribe(Path("synthetic.mp4"), "small")
+        self.assertEqual(words, [(1.23456789, 1.23456799, "original"), (40.0, 80.0, "long")])
+        self.assertIn("review alignment", output.getvalue())
+
+    def test_transcribe_uses_reviewable_multilingual_defaults_and_preserves_tokens(self):
+        class FakeModel:
+            def transcribe(self, path, **options):
+                self.options = options
+                word = types.SimpleNamespace(word=" bhai!", start=1.0, end=1.1)
+                return ([types.SimpleNamespace(words=[word])], None)
+
+        fake = FakeModel()
+        module = types.SimpleNamespace(WhisperModel=lambda *args, **kwargs: fake)
+        with patch.dict(sys.modules, {"faster_whisper": module}), patch("builtins.print"):
+            words = pipeline.transcribe(Path("synthetic.mp4"), "small")
+        self.assertEqual(words, [(1.0, 1.1, "bhai!")])
+        self.assertEqual(fake.options, {"word_timestamps": True, "vad_filter": True, "beam_size": 5})
+
+    def test_transcribe_can_explicitly_select_hindi(self):
+        class FakeModel:
+            def transcribe(self, path, **options):
+                self.options = options
+                return ([], None)
+
+        fake = FakeModel()
+        module = types.SimpleNamespace(WhisperModel=lambda *args, **kwargs: fake)
+        with patch.dict(sys.modules, {"faster_whisper": module}):
+            pipeline.transcribe(Path("synthetic.mp4"), "base", language="hi")
+        self.assertEqual(fake.options["language"], "hi")
+
+    def test_transcribe_can_explicitly_select_english(self):
+        class FakeModel:
+            def transcribe(self, path, **options):
+                self.options = options
+                return ([], None)
+
+        fake = FakeModel()
+        module = types.SimpleNamespace(WhisperModel=lambda *args, **kwargs: fake)
+        with patch.dict(sys.modules, {"faster_whisper": module}):
+            pipeline.transcribe(Path("synthetic.mp4"), "small", language="en")
+        self.assertEqual(fake.options["language"], "en")
+
     def test_parse_time_rejects_non_finite_values(self):
         for value in ("nan", "inf", "-inf"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
@@ -71,7 +132,7 @@ class AutomaticClipRangeTests(unittest.TestCase):
         source = Path(tmp.name) / "source.mp4"
         source.write_bytes(b"source")
         argv = ["video_pipeline.py", "shorts", "--source", str(source),
-                "--no-subtitles", "--auto-clips", "5"]
+                "--no-subtitles", "--auto-clips", "5", "--rights-state", "owned"]
         with patch.object(sys, "argv", argv), patch.object(pipeline, "require_tool"), \
                 patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 4.5, "local": True}), \
                 patch.object(pipeline, "acquire", return_value=source), \
@@ -135,6 +196,30 @@ class SourceVideoQualityTests(unittest.TestCase):
         self.assertTrue(all("height>=720" in branch for branch in branches))
         self.assertEqual(branches, ["bv[height>=720]+ba", "b[height>=720]"])
 
+    def test_shared_runtime_options_use_portable_node_discovery(self):
+        self.assertEqual(quality.yt_dlp_runtime_options(), ["--js-runtimes", "node"])
+        self.assertNotIn("/Users/", " ".join(quality.yt_dlp_runtime_options()))
+
+    def test_video_pipeline_metadata_and_download_share_runtime_options(self):
+        import json
+        data = {"title": "source", "duration": 5,
+                "formats": [{"height": 720, "vcodec": "avc1", "acodec": "aac"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            def fake_run(command, **kwargs):
+                if "--dump-single-json" in command:
+                    return types.SimpleNamespace(stdout=json.dumps(data))
+                Path(str(command[command.index("-o") + 1]).replace("%(ext)s", "mp4")).write_bytes(b"video")
+            with patch.object(pipeline.Path, "exists", return_value=False), \
+                    patch.object(pipeline, "WORK", work), patch.object(pipeline, "run", side_effect=fake_run) as run, \
+                    patch.object(pipeline, "probe_video", return_value={"width": 1280, "height": 720}):
+                pipeline.get_info("https://example.invalid/video")
+                pipeline.acquire("https://example.invalid/video", "source")
+            yt_commands = [call.args[0] for call in run.call_args_list]
+            runtime_args = quality.yt_dlp_runtime_options()
+            self.assertEqual(len(yt_commands), 3)
+            self.assertTrue(all(command[1:3] == runtime_args for command in yt_commands))
+
     def test_all_url_pipelines_share_strict_policy(self):
         import clip_pipeline
         import long_video_pipeline
@@ -154,6 +239,34 @@ class SourceVideoQualityTests(unittest.TestCase):
         self.assertIn("FORMAT_SPEC", process_raj_podcast.process_podcast_clip.__code__.co_names)
         self.assertEqual(clip_pipeline.YTDLP_FORMAT, selector)
         self.assertEqual(process_raj_podcast.FORMAT_SPEC, selector)
+
+    def test_clip_pipeline_metadata_and_download_share_runtime_options(self):
+        import json
+        import clip_pipeline
+        data = {"title": "source", "duration": 10, "uploader": "uploader", "channel": "channel",
+                "formats": [{"height": 720, "vcodec": "avc1", "acodec": "aac"}]}
+        payload = json.dumps(data)
+        with patch.object(clip_pipeline.subprocess, "check_output", return_value=payload) as check_output:
+            clip_pipeline.get_video_info("https://example.invalid/video")
+        metadata_command = check_output.call_args.args[0]
+        clip = {"id": 1, "title": "clip", "start": "00:00:01", "end": "00:00:02"}
+        model = types.SimpleNamespace(transcribe=lambda *args, **kwargs: ([], None))
+        with patch.object(clip_pipeline.subprocess, "check_output", return_value=payload) as check_output, \
+                patch.object(clip_pipeline.subprocess, "run") as run, \
+                patch.object(clip_pipeline, "generate_ass_subtitles"), \
+                patch.object(clip_pipeline, "WORKSPACE_DIR", tempfile.gettempdir()), \
+                patch("builtins.print"):
+            clip_pipeline.process_clip("https://example.invalid/video", clip, model, "output.mp4")
+        clip_metadata_command = check_output.call_args_list[0].args[0]
+        runtime_args = quality.yt_dlp_runtime_options()
+        yt_commands = [call.args[0] for call in run.call_args_list
+                       if "yt_dlp" in call.args[0]]
+        self.assertEqual(len(yt_commands), 1)
+        download_command = yt_commands[0]
+        for command in (metadata_command, clip_metadata_command, download_command):
+            self.assertIn("yt_dlp", command)
+            start = command.index(runtime_args[0])
+            self.assertEqual(command[start:start + len(runtime_args)], runtime_args)
 
 
 class OutputProtectionTests(unittest.TestCase):
@@ -470,13 +583,15 @@ class YouTubeMetadataTests(unittest.TestCase):
             output.mkdir()
             args = ["video_pipeline.py", "long", "--source", "source.mp4", "--upload",
                     "--client-secrets", str(client), "--category-id", "27",
-                    "--tag", "podcast", "--tag", "education"]
+                    "--tag", "podcast", "--tag", "education", "--rights-state", "owned",
+                    "--approval-file", "approval.json"]
             with patch.object(sys, "argv", args), patch.object(pipeline, "OUTPUT", output), \
                     patch.object(pipeline, "require_tool"), \
                     patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 30, "local": True}), \
                     patch.object(pipeline, "acquire", return_value=Path("source.mp4")), \
                     patch.object(pipeline, "render_long", side_effect=lambda source, path, start, end, *filters: path.write_bytes(b"video")), \
-                    patch.object(pipeline, "upload_youtube") as upload:
+                    patch.object(pipeline, "upload_youtube") as upload, \
+                    patch.object(pipeline, "validate_approval"):
                 with patch("builtins.print"):
                     pipeline.main()
             self.assertEqual(upload.call_args.kwargs["category_id"], "27")
@@ -503,14 +618,19 @@ class BothModeTests(unittest.TestCase):
             if long_error:
                 raise RuntimeError("long render broke")
             output.write_bytes(b"long")
-        argv = ["video_pipeline.py", mode, "--source", str(source), "--no-subtitles", *extra]
+        if "--upload" in extra:
+            extra = [*extra, "--rights-state", "owned", "--approval-file", "approval-a.json",
+                     "--approval-file", "approval-b.json"]
+        argv = ["video_pipeline.py", mode, "--source", str(source), "--no-subtitles",
+                "--rights-state", "owned", *extra]
         with patch.object(sys, "argv", argv), patch.object(pipeline, "OUTPUT", outputs), \
                 patch.object(pipeline, "require_tool"), \
                 patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 60, "local": True}), \
                 patch.object(pipeline, "acquire", return_value=source) as acquire, \
                 patch.object(pipeline, "render_short", side_effect=short) as rs, \
                 patch.object(pipeline, "render_long", side_effect=long) as rl, \
-                patch.object(pipeline, "upload_youtube") as upload, patch("builtins.print"):
+                patch.object(pipeline, "upload_youtube") as upload, \
+                patch.object(pipeline, "validate_approval"), patch("builtins.print"):
             try:
                 pipeline.main()
             except BaseException as exc:
@@ -561,7 +681,7 @@ class BothModeTests(unittest.TestCase):
             outputs.mkdir()
             downloaded = root / "downloaded.mp4"
             argv = ["video_pipeline.py", "shorts", "--source", "https://example.invalid/video",
-                    "--clip", "1-5", "--no-subtitles"]
+                    "--clip", "1-5", "--no-subtitles", "--rights-state", "owned"]
             with patch.object(sys, "argv", argv), patch.object(pipeline, "OUTPUT", outputs), \
                     patch.object(pipeline, "require_tool"), \
                     patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 60, "local": False}), \
@@ -590,6 +710,82 @@ class BothModeTests(unittest.TestCase):
         self.assertIsNone(shorts_error)
         *_, long_error = self.run_cli("long", ["--start", "1", "--end", "5"])
         self.assertIsNone(long_error)
+
+
+class ReusablePipelineTests(unittest.TestCase):
+    def run_process(self, mode, **options):
+        options.setdefault("rights_state", "owned")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        output = root / "output"
+        output.mkdir()
+        source = root / "source.mp4"
+        source.write_bytes(b"source")
+
+        def render(_source, path, *args):
+            path.write_bytes(b"video")
+
+        with patch.object(pipeline, "OUTPUT", output), patch.object(pipeline, "require_tool"), \
+                patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 60, "local": True}), \
+                patch.object(pipeline, "acquire", return_value=source), \
+                patch.object(pipeline, "render_short", side_effect=render) as short, \
+                patch.object(pipeline, "render_long", side_effect=render) as long, \
+                patch.object(pipeline, "upload_youtube", return_value={
+                    "video_id": "mock-id", "url": "https://youtu.be/mock-id"}) as upload, \
+                patch.object(pipeline, "validate_approval"), \
+                patch("builtins.print"):
+            result = pipeline.process_video(mode=mode, source=str(source), no_subtitles=True, **options)
+        return output, result, short, long, upload
+
+    def test_modes_generate_exact_requested_outputs_and_structured_paths(self):
+        output, shorts, short_render, long_render, _ = self.run_process(
+            "shorts", auto_clips=3, clip_length=10)
+        self.assertEqual(len(shorts.output_paths), 3)
+        self.assertEqual(short_render.call_count, 3)
+        long_render.assert_not_called()
+        self.assertTrue(all(path.parent == output for path in shorts.output_paths))
+        self.assertEqual(shorts.outputs, shorts.output_paths)
+
+        _, long_result, short_render, long_render, _ = self.run_process("long")
+        self.assertEqual(len(long_result.output_paths), 1)
+        short_render.assert_not_called()
+        long_render.assert_called_once()
+
+        _, both, short_render, long_render, _ = self.run_process(
+            "both", auto_clips=2, clip_length=10, short_clip=[])
+        self.assertEqual(len(both.output_paths), 3)
+        self.assertEqual(short_render.call_count, 2)
+        long_render.assert_called_once()
+        self.assertEqual(both.youtube_video_ids, [])
+        self.assertEqual(both.youtube_urls, [])
+
+    def test_progress_callback_and_upload_metadata_are_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = Path(directory) / "client.json"
+            client.write_text("mock client")
+            events = []
+            output, result, _, _, upload = self.run_process(
+                "shorts", auto_clips=1, upload=True, client_secrets=client,
+                rights_state="owned", approval_files=["approval.json"],
+                progress_callback=events.append)
+        self.assertEqual(result.youtube_video_ids, ["mock-id"])
+        self.assertEqual(result.youtube_urls, ["https://youtu.be/mock-id"])
+        upload.assert_called_once()
+        self.assertEqual([event["event"] for event in events],
+                         ["rendering", "completed", "uploading", "uploaded"])
+        self.assertEqual(result.output_paths, [output / "source_short_01.mp4"])
+
+    def test_main_delegates_parsed_cli_arguments_to_reusable_function(self):
+        argv = ["video_pipeline.py", "shorts", "--source", "source.mp4", "--clip", "1-5",
+                "--no-subtitles", "--banner", "--volume", "1.5"]
+        expected = pipeline.VideoPipelineResult()
+        with patch.object(sys, "argv", argv), patch.object(pipeline, "process_video", return_value=expected) as process:
+            self.assertIs(pipeline.main(), expected)
+        self.assertEqual(process.call_args.kwargs["mode"], "shorts")
+        self.assertEqual(process.call_args.kwargs["clip"], ["1-5"])
+        self.assertTrue(process.call_args.kwargs["banner"])
+        self.assertEqual(process.call_args.kwargs["volume"], 1.5)
 
 
 if __name__ == "__main__":

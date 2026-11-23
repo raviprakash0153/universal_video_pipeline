@@ -16,9 +16,9 @@ import json
 import argparse
 from datetime import datetime
 from faster_whisper import WhisperModel
-from source_video_quality import quality_format_selector, validate_video_formats
+from source_video_quality import quality_format_selector, validate_video_formats, yt_dlp_runtime_options
+from timestamp_validation import valid_word_timestamps
 
-NODE_PATH = "/Users/raviprakash/.nvm/versions/node/v22.17.1/bin/node"
 FONTS_DIR = "/System/Library/Fonts/Supplemental"
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_DIR = os.path.join(WORKSPACE_DIR, "upload_queue")
@@ -49,7 +49,7 @@ def get_video_info(url: str):
     """Fetches video title, duration, and channel metadata using yt-dlp."""
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--js-runtimes", f"node:{NODE_PATH}",
+        *yt_dlp_runtime_options(),
         "--remote-components", "ejs:github",
         "--format", YTDLP_FORMAT,
         "--dump-json", "--no-download",
@@ -71,7 +71,7 @@ def get_video_info(url: str):
                 continue
     raise ValueError("Could not parse video metadata from YouTube URL.")
 
-def generate_ass_subtitles(words, ass_filename: str, fallback_title: str):
+def generate_ass_subtitles(words, ass_filename: str, fallback_title: str, caption_language: str = "original"):
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -85,11 +85,19 @@ Style: Hormozi,Impact,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,10
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+    from hinglish import to_hinglish
+    if caption_language not in {"original", "hinglish"}:
+        raise ValueError("caption language must be 'original' or 'hinglish'")
     valid_words = []
     for w in words:
-        cw = clean_word(w.word)
+        token = str(getattr(w, "word", ""))
+        timestamps = valid_word_timestamps(getattr(w, "start", None), getattr(w, "end", None), token)
+        if timestamps is None:
+            continue
+        display_token = to_hinglish(token) if caption_language == "hinglish" else token
+        cw = display_token.strip() if caption_language == "hinglish" else clean_word(display_token)
         if cw and len(cw) > 0 and not cw.startswith('.'):
-            valid_words.append((w.start, w.end, cw))
+            valid_words.append((*timestamps, cw))
 
     events = []
     if not valid_words:
@@ -108,7 +116,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         line_parts.append(text)
                 line_text = " ".join(line_parts)
                 start_str = format_ass_time(w_start)
-                end_str   = format_ass_time(max(w_end, w_start + 0.25))
+                end_str   = format_ass_time(w_end)
                 events.append(f"Dialogue: 0,{start_str},{end_str},Hormozi,,0,0,0,,{{\\pos(540,825)}}{line_text}")
 
     with open(ass_filename, "w", encoding="utf-8") as f:
@@ -116,7 +124,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 # ─────────────────────────── CLIP PROCESSING ───────────────────────────
 
-def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: str):
+def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: str,
+                 language: str | None = None, caption_language: str = "original"):
     raw_file = os.path.join(WORKSPACE_DIR, f"temp_raw_{clip_info['id']}.mp4")
     ass_file = os.path.join(WORKSPACE_DIR, f"temp_sub_{clip_info['id']}.ass")
 
@@ -129,6 +138,7 @@ def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: st
     # 1. Download segment
     dl_cmd = [
         sys.executable, "-m", "yt_dlp",
+        *yt_dlp_runtime_options(),
         "--extractor-args", "youtube:player_client=tv_embedded",
         "--format", YTDLP_FORMAT,
         "--dump-single-json", "--no-download", url
@@ -137,6 +147,7 @@ def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: st
     validate_video_formats(json.loads(metadata))
     dl_cmd = [
         sys.executable, "-m", "yt_dlp",
+        *yt_dlp_runtime_options(),
         "--extractor-args", "youtube:player_client=tv_embedded",
         "--format", YTDLP_FORMAT,
         "--download-sections", f"*{clip_info['start']}-{clip_info['end']}",
@@ -150,13 +161,16 @@ def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: st
 
     # 2. Transcribe
     print("▶ Step 2: Transcribing speech with faster-whisper...")
-    segments, _ = model.transcribe(raw_file, word_timestamps=True)
+    options = {"word_timestamps": True, "beam_size": 5}
+    if language is not None:
+        options["language"] = language
+    segments, _ = model.transcribe(raw_file, **options)
     all_words = []
     for s in segments:
         if s.words:
             all_words.extend(s.words)
     print(f"   Detected {len(all_words)} words in audio.")
-    generate_ass_subtitles(all_words, ass_file, clip_info['title'])
+    generate_ass_subtitles(all_words, ass_file, clip_info['title'], caption_language)
 
     # 3. Framing & Rendering (9:16 layout)
     print("▶ Step 3: Rendering 1080x1920 vertical short...")
@@ -204,7 +218,7 @@ def process_clip(url: str, clip_info: dict, model: WhisperModel, output_path: st
 
 def run_scheduled_upload():
     """Triggered by cron/scheduler at 6 AM, 6 PM, or 10 PM. Picks the next short in queue and uploads it."""
-    import youtube_uploader
+    raise RuntimeError("Legacy scheduled publishing is disabled; use the individually approved private publishing flow.")
 
     manifests = sorted(glob.glob(os.path.join(QUEUE_DIR, "*.json")))
     if not manifests:
@@ -258,7 +272,10 @@ def cleanup_workspace():
 
 # ─────────────────────────── MAIN PIPELINE ───────────────────────────
 
-def generate_shorts_for_url(url: str, upload_now: bool = False):
+def generate_shorts_for_url(url: str, upload_now: bool = False, whisper_model: str = "small",
+                            whisper_language: str | None = None, caption_language: str = "original"):
+    if upload_now:
+        raise RuntimeError("Legacy direct publishing is disabled; use the individually approved private publishing flow.")
     print("=======================================================")
     print("🚀 Viral Shorts Clipping & Scheduling Pipeline")
     print(f"   URL: {url}")
@@ -307,8 +324,8 @@ def generate_shorts_for_url(url: str, upload_now: bool = False):
             }
         ]
 
-    print("Loading faster-whisper model (tiny, int8 CPU)...")
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    print(f"Loading faster-whisper model ({whisper_model}, int8 CPU)...")
+    model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
 
     generated_files = []
     slot_names = ["06:00 AM (Morning)", "06:00 PM (Evening)", "10:00 PM (Night)"]
@@ -316,7 +333,8 @@ def generate_shorts_for_url(url: str, upload_now: bool = False):
     for idx, clip in enumerate(clips):
         filename = f"viral_short_{clip['id']}.mp4"
         output_file = os.path.join(WORKSPACE_DIR, filename)
-        process_clip(url, clip, model, output_file)
+        process_clip(url, clip, model, output_file, language=whisper_language,
+                     caption_language=caption_language)
         generated_files.append(output_file)
 
         # Build viral metadata
@@ -334,7 +352,7 @@ Subscribe for daily viral shorts & gaming clips!
 #Shorts #{uploader.replace(' ', '')} #Gaming #Viral #FunnyMoments
 """,
             "tags": ["Shorts", uploader, "Gaming", "Viral", "Funny Moments", "Speed Clips", "Clips"],
-            "privacy": "public",
+            "privacy": "private",
             "scheduled_slot": slot_names[idx]
         }
 
@@ -363,7 +381,7 @@ Subscribe for daily viral shorts & gaming clips!
                 title=meta["title"],
                 description=meta["description"],
                 tags=meta["tags"],
-                privacy_status="public"
+                privacy_status="private"
             )
             os.remove(manifest_file)
     else:
@@ -377,6 +395,9 @@ def main():
     parser.add_argument("--url", type=str, help="YouTube Video URL")
     parser.add_argument("--upload-now", action="store_true", help="Upload all 3 immediately instead of queueing for schedule")
     parser.add_argument("--cron-upload", action="store_true", help="Invoked by cron scheduler to upload next queued video")
+    parser.add_argument("--whisper-model", default="small", choices=["tiny", "base", "small", "medium"])
+    parser.add_argument("--whisper-language", choices=["hi", "en"], default=None)
+    parser.add_argument("--caption-language", choices=["original", "hinglish"], default="original")
 
     args = parser.parse_args()
 
@@ -399,7 +420,8 @@ def main():
         print("❌ Error: No URL provided.")
         sys.exit(1)
 
-    generate_shorts_for_url(url, upload_now=args.upload_now)
+    generate_shorts_for_url(url, upload_now=args.upload_now, whisper_model=args.whisper_model,
+                            whisper_language=args.whisper_language, caption_language=args.caption_language)
 
 if __name__ == "__main__":
     main()
