@@ -9,9 +9,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
+import ipaddress
 import json
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import pipeline_store
 from news_research import MultiSourceNewsProvider, research_news
@@ -39,6 +40,41 @@ _STOP = {"with", "from", "that", "this", "have", "after", "into", "over", "will"
 DEFAULT_NOVELTY_LOOKBACK_DAYS = 7
 SHORTLIST_SIZE = 10
 PUBLISHER_SHORTLIST_LIMIT = 2
+
+
+def _association_reference(value):
+    """Return a normalized usable absolute HTTP(S) URL, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if any(character.isspace() for character in value):
+        return None
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            return None
+        hostname = parsed.hostname
+        if not hostname:
+            return None
+        # Accessing port validates malformed port syntax; hostname checks below
+        # reject whitespace and malformed DNS labels without doing DNS lookups.
+        _ = parsed.port
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            if parsed.netloc.rsplit("@", 1)[-1].startswith("["):
+                return None
+            host = hostname.rstrip(".").encode("idna").decode("ascii")
+            labels = host.split(".")
+            if (not host or len(host) > 253 or any(
+                    not label or len(label) > 63 or
+                    not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?", label)
+                    for label in labels)):
+                return None
+        return urlunparse((parsed.scheme.casefold(), parsed.netloc.casefold(),
+                           parsed.path, parsed.params, parsed.query, parsed.fragment))
+    except (TypeError, ValueError, UnicodeError):
+        return None
 
 
 @dataclass
@@ -280,7 +316,51 @@ def _publisher_identity(article: dict) -> str:
     return publisher or (urlparse(article.get("url") or "").hostname or "unknown").removeprefix("www.")
 
 
-def _build_shortlist(topics: list[Topic], coverage: str) -> tuple[list[Topic], list[str]]:
+def _diagnostic_publisher_identities(topic: Topic):
+    """Expose only publisher identities supported by topic article metadata."""
+    identities = []
+    for article in topic.articles:
+        origin = article.get("original_source_url")
+        host = (urlparse(origin).hostname or "").casefold() if origin else ""
+        publisher = re.sub(r"\s+", " ", (article.get("publisher") or "").casefold()).strip()
+        article_host = (urlparse(article.get("url") or "").hostname or "").removeprefix("www.")
+        identity = host.removeprefix("www.") or publisher or article_host
+        if identity and identity not in identities:
+            identities.append(identity)
+    return identities or "unavailable"
+
+
+def _diagnostic_publisher_identity_details(topic: Topic):
+    """Describe known publisher identities separately from algorithm buckets."""
+    identities = _diagnostic_publisher_identities(topic)
+    available = identities != "unavailable"
+    article_identities = []
+    effective_buckets = []
+    for index, article in enumerate(topic.articles):
+        identity = _publisher_identity(article)
+        known = identity != "unknown"
+        article_identities.append({
+            "article_index": index,
+            "publisher_identity": identity if known else "unavailable",
+            "identity_status": "known_identity" if known else "unavailable",
+            "effective_publisher_cap_bucket": identity,
+            "bucket_status": "known_identity" if known else "shared_unknown_fallback",
+        })
+        if identity not in effective_buckets:
+            effective_buckets.append(identity)
+    return {
+        "publisher_identity_status": "available" if available else "unavailable",
+        "effective_publisher_cap_buckets": effective_buckets,
+        "publisher_cap_bucket_status": (
+            "mixed_known_and_shared_unknown_fallback" if available and "unknown" in effective_buckets
+            else "known_identity" if available
+            else "shared_unknown_fallback"
+        ),
+        "publisher_article_identities": article_identities,
+    }
+
+
+def _build_shortlist(topics: list[Topic], coverage: str, diagnostic_events=None) -> tuple[list[Topic], list[str]]:
     """Apply deterministic geography and publisher limits to the ranked top ten."""
     pool = list(topics)
     if not pool:
@@ -293,12 +373,21 @@ def _build_shortlist(topics: list[Topic], coverage: str) -> tuple[list[Topic], l
     selected = []
     remaining = list(pool)
     publisher_changed = False
+    cap_affected = set()
+    cap_relaxed = set()
+    balance_affected = set()
     while remaining and len(selected) < target:
         slots = target - len(selected)
         eligible = [t for t in remaining if all(
             publisher_counts.get(_publisher_identity(a), 0) < PUBLISHER_SHORTLIST_LIMIT
             for a in t.articles)]
+        if diagnostic_events is not None:
+            for topic in remaining:
+                if topic not in eligible:
+                    cap_affected.add(topic.topic_id)
         if not eligible:
+            if diagnostic_events is not None:
+                cap_relaxed.update(topic.topic_id for topic in remaining)
             eligible = remaining
             if "publisher limit relaxed: no alternative eligible story" not in reasons:
                 reasons.append("publisher limit relaxed: no alternative eligible story")
@@ -307,9 +396,16 @@ def _build_shortlist(topics: list[Topic], coverage: str) -> tuple[list[Topic], l
             choices = [t for t in eligible if t.relevance in need]
             if not choices:
                 choices = [t for t in remaining if t.relevance in need]
+                if diagnostic_events is not None:
+                    cap_relaxed.update(topic.topic_id for topic in choices if topic not in eligible)
                 if choices and "publisher limit relaxed to include available geography" not in reasons:
                     reasons.append("publisher limit relaxed to include available geography")
             if choices:
+                if diagnostic_events is not None and choices[0] is not eligible[0]:
+                    balance_affected.add(choices[0].topic_id)
+                    for topic in eligible:
+                        if topic not in choices and pool.index(topic) < pool.index(choices[0]):
+                            balance_affected.add(topic.topic_id)
                 if "geography balancing changed shortlist" not in reasons:
                     reasons.append("geography balancing changed shortlist")
                 chosen = choices[0]
@@ -325,13 +421,68 @@ def _build_shortlist(topics: list[Topic], coverage: str) -> tuple[list[Topic], l
             geo_counts[chosen.relevance] += 1
         for identity in {_publisher_identity(a) for a in chosen.articles}:
             publisher_counts[identity] = publisher_counts.get(identity, 0) + 1
+    if diagnostic_events is not None:
+        try:
+            selected_order = {topic.topic_id: index + 1 for index, topic in enumerate(selected)}
+            final_cap_blocking_buckets = {
+                topic.topic_id: {
+                    _publisher_identity(article) for article in topic.articles
+                    if publisher_counts.get(_publisher_identity(article), 0) >= PUBLISHER_SHORTLIST_LIMIT
+                }
+                for topic in remaining if topic.topic_id not in cap_relaxed
+            }
+            final_cap_blocked = {
+                topic_id for topic_id, buckets in final_cap_blocking_buckets.items() if buckets
+            }
+            for rank, topic in enumerate(pool, 1):
+                picked = topic.topic_id in selected_order
+                final_cap_exclusion = (not picked and topic.topic_id in final_cap_blocked and
+                                       topic.topic_id not in balance_affected and
+                                       len(selected) >= target)
+                diagnostic_events.append({
+                    "topic_id": topic.topic_id, "candidate_topic_ref": topic.topic_id,
+                    "shortlist_eligibility": "eligible", "category": topic.category,
+                    "geography_classification": topic.relevance or "unavailable",
+                    "publisher_identities": _diagnostic_publisher_identities(topic),
+                    **_diagnostic_publisher_identity_details(topic),
+                    "publisher_cap_affected_eligibility": ("yes" if topic.topic_id in cap_affected else "no"),
+                    "publisher_cap_final_exclusion": "yes" if final_cap_exclusion else "no",
+                    "geography_balance_affected_selection": ("yes" if topic.topic_id in balance_affected else "no"),
+                    "selected": "yes" if picked else "no",
+                    "decision_reason": ("selected_by_rank_and_constraints" if picked else
+                                        "geography_balance_exclusion" if topic.topic_id in balance_affected else
+                                        "excluded_by_publisher_cap" if final_cap_exclusion else
+                                        "shortlist_limit_reached"),
+                    "publisher_cap_exclusion_type": (
+                        "multiple_blocking_buckets" if final_cap_exclusion and
+                        len(final_cap_blocking_buckets.get(topic.topic_id, ())) > 1
+                        else "unavailable_identity_shared_fallback" if final_cap_exclusion and
+                        final_cap_blocking_buckets.get(topic.topic_id) == {"unknown"}
+                        else "known_shared_publisher" if final_cap_exclusion
+                        else "not_final_excluded_by_cap"
+                    ),
+                    "ranking_score": topic.score, "ranking_order": rank,
+                    "selection_order": selected_order.get(topic.topic_id),
+                    "constraints": {"shortlist_size": SHORTLIST_SIZE,
+                                    "publisher_limit": PUBLISHER_SHORTLIST_LIMIT,
+                                    "coverage_mode": coverage,
+                                    "geography_balance_applicable": bool(both_geos)},
+                })
+        except Exception:
+            # Recording is observational only and must never affect selection.
+            pass
     if publisher_changed:
         reasons.append("publisher concentration limit changed shortlist")
     return selected, reasons
 
 
+def _record_diagnostic_relationship(ledger: dict, relationship: dict) -> None:
+    ledger["relationships"].append(relationship)
+
+
 def discover_topics(*, provider=None, categories: dict | None = None, queries_per_category=1,
-                    weights: dict | None = None, coverage="india_and_global", progress=None) -> tuple[str, list[Topic], dict]:
+                    weights: dict | None = None, coverage="india_and_global", progress=None,
+                    diagnostics: dict | None = None) -> tuple[str, list[Topic], dict]:
     """Run configurable free-source queries then inspect and rank candidate stories."""
     provider = provider or MultiSourceNewsProvider()
     selected = categories or CATEGORIES
@@ -340,6 +491,10 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
     topic_queries = {}
     topic_origins = {}
     query_merge_counts = {}
+    ledger = {"schema_version": 1, "queries": [], "candidates": [], "topics": [],
+              "relationships": []} if diagnostics is not None else None
+    query_rows = {}
+    diagnostics_failure = None
     for category, queries in selected.items():
         for query in list(queries)[:queries_per_category]:
             # Separate India and worldwide discovery so a strong global result
@@ -348,12 +503,98 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
                 ((query + " India", "india"),) if coverage == "india" else ((query, "global"),))
             for geo_query, relevance in geos:
                 key = category + ":" + geo_query
+                query_id = "query-" + sha256(f"{len(query_rows)}\0{category}\0{geo_query}\0{relevance}".encode()).hexdigest()[:16]
+                if ledger is not None:
+                    query_row = {"query_id": query_id, "source_category": category,
+                                 "generated_query": geo_query, "geography_intent": relevance,
+                                 "discovery_status": "not_attempted", "candidate_count": None,
+                                 "candidate_count_unit": "article_candidates"}
+                    ledger["queries"].append(query_row)
+                    query_rows[key] = query_row
                 try:
                     report = research_news(geo_query, provider=provider, latest=True)
                     before = len(report.items)
                     discovered_topics = cluster_report_items(report.items, category=category, relevance=relevance)
                     discovered_topics = [score_topic(topic, weights=weights) for topic in discovered_topics]
                     metrics = report.metrics
+                    try:
+                        candidate_ids_by_url = {}
+                        if ledger is not None:
+                            query_row = query_rows[key]
+                            search_errors = metrics.get("search_errors", [])
+                            query_failed = bool(search_errors) and not metrics.get("results_received", 0)
+                            query_row["discovery_status"] = "failed" if query_failed else "success"
+                            if query_failed:
+                                query_row["discovery_failure_reason"] = "search_failed_without_candidates"
+                            query_row["candidate_count"] = metrics.get("results_received")
+                            query_row["returned_news_item_count"] = len(report.items)
+                            query_row["returned_news_item_count_unit"] = "news_items"
+                            attempts = metrics.get("article_attempts", [])
+                            # Article attempts intentionally omit full text. Match candidate references only by
+                            # request/final URL within this run; the URLs are never copied into the ledger.
+                            for index, attempt in enumerate(attempts):
+                                candidate_id = "candidate-" + sha256(f"{query_id}\0{index}".encode()).hexdigest()[:16]
+                                candidate = {"candidate_id": candidate_id, "query_id": query_id,
+                                    "originating_query": query_id,
+                                    "url_resolution": "unavailable", "publisher_extraction": "unavailable",
+                                    "evidence": "unavailable", "headline_match_verification": "unavailable",
+                                    "claim_verification": "unavailable",
+                                    "ranking_eligibility": "not_attempted", "topic_ids": [],
+                                    "association_state": "unavailable", "association_attempted": False,
+                                    "topic_verification": []}
+                                resolution = attempt.get("resolver_diagnostics") or {}
+                                resolution_state = resolution.get("result")
+                                if resolution.get("failure_stage") == "resolver-budget":
+                                    resolution_state = "budget_skipped"
+                                elif not attempt.get("google_news_url"):
+                                    resolution_state = "not_attempted"
+                                elif resolution_state == "resolved":
+                                    resolution_state = "success"
+                                elif resolution_state not in {"success", "failed", "unavailable", "not_attempted"}:
+                                    resolution_state = "failed" if resolution.get("failure") else "unavailable"
+                                candidate["url_resolution"] = {"state": resolution_state,
+                                    "failure_stage": resolution.get("failure_stage")}
+                                extraction = attempt.get("extraction_method")
+                                candidate["publisher_extraction"] = ("success" if extraction else
+                                    "failed" if attempt.get("page_issue") or attempt.get("rejection_reason") else "unavailable")
+                                refs = tuple(normalized for ref in (attempt.get("rss_url"), attempt.get("requested_url"),
+                                    attempt.get("final_url"), attempt.get("original_publisher_url"))
+                                    if (normalized := _association_reference(ref)) is not None)
+                                candidate["association_attempted"] = bool(refs)
+                                # Evidence is assigned after URL indexes are complete below. Until then, retain
+                                # extraction status independently from evidence attribution.
+                                candidate["evidence"] = "not_accepted" if attempt.get("extraction_method") else "unavailable"
+                                candidate["headline_match_verification"] = (
+                                    "matched" if attempt.get("candidate_verified") else "not_matched"
+                                    if attempt.get("google_news_url") else "unavailable")
+                                candidate["candidate_ordinal"] = index
+                                for ref in refs:
+                                    if ref:
+                                        ids = candidate_ids_by_url.setdefault(ref, [])
+                                        if candidate_id not in ids:
+                                            ids.append(candidate_id)
+                                ledger["candidates"].append(candidate)
+                            for item in report.items:
+                                for source in item.sources:
+                                    if not (source.accessible and source.evidence):
+                                        continue
+                                    refs = {normalized for ref in (source.requested_url, source.url, source.final_url,
+                                                        source.original_source_url)
+                                            if (normalized := _association_reference(ref)) is not None}
+                                    matched_ids = {cid for ref in refs for cid in candidate_ids_by_url.get(ref, [])}
+                                    if len(matched_ids) == 1:
+                                        next(c for c in ledger["candidates"] if c["candidate_id"] in matched_ids)["evidence"] = "accepted"
+                                    elif len(matched_ids) > 1:
+                                        for candidate in ledger["candidates"]:
+                                            if candidate["candidate_id"] in matched_ids:
+                                                candidate["evidence"] = "ambiguous"
+                                        ledger["relationships"].append({"type": "ambiguous_evidence_attribution",
+                                            "candidate_ids": sorted(matched_ids), "status": "ambiguous"})
+                            # results_received is the provider's post-deduplication article-candidate count.
+                            # Attempts/rejections are stage counts, not additional candidates.
+                    except Exception as diagnostic_exc:
+                        ledger = None
+                        diagnostics_failure = type(diagnostic_exc).__name__
                     rejected = metrics.get("articles_rejected", [])
                     accepted_count = metrics.get("accessible_articles", sum(
                         1 for item in report.items for article in item.sources if article.accessible and article.evidence))
@@ -377,22 +618,71 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
                     for topic in discovered_topics:
                         topic_queries.setdefault(topic.topic_id, set()).add(key)
                         topic_origins[id(topic)] = key
+                        try:
+                            if ledger is not None:
+                                ledger["topics"].append({"topic_id": topic.topic_id,
+                                    "query_id": query_rows[key]["query_id"],
+                                    "category": topic.category,
+                                    "relevant_categories": list(topic.relevant_categories),
+                                    "category_exclusion_reason": None,
+                                    "ranking_eligibility": "not_attempted",
+                                    "score": topic.score, "verification_status": topic.verification_status,
+                                    "duplicate_cluster_relationship": "unavailable"})
+                                for article in topic.articles:
+                                    ref = _association_reference(article.get("requested_url"))
+                                    if ref is None:
+                                        ref = _association_reference(article.get("url"))
+                                    cids = candidate_ids_by_url.get(ref, [])
+                                    for cid in cids:
+                                        candidate = next(c for c in ledger["candidates"] if c["candidate_id"] == cid)
+                                        if topic.topic_id not in candidate["topic_ids"]:
+                                            candidate["topic_ids"].append(topic.topic_id)
+                                        candidate["claim_verification"] = topic.verification_status
+                                        candidate["topic_verification"].append({"topic_id": topic.topic_id,
+                                            "verification_status": topic.verification_status})
+                                        candidate["association_state"] = "ambiguous" if len(cids) > 1 else "matched"
+                                    if len(cids) > 1:
+                                        ledger["relationships"].append({"type": "ambiguous_candidate_association",
+                                            "topic_id": topic.topic_id, "candidate_ids": list(cids), "status": "ambiguous"})
+                        except Exception as diagnostic_exc:
+                            ledger = None
+                            diagnostics_failure = type(diagnostic_exc).__name__
+
                 except Exception as exc:
                     from news_research import _safe_provider_failure
                     statuses[key] = {"status": "failed", "error_type": type(exc).__name__,
                                      "error": _safe_provider_failure(exc)}
+                    if ledger is not None:
+                        query_rows[key]["discovery_status"] = "failed"
                 if progress:
                     progress(key, statuses[key])
     # Merge clusters that cross query boundaries, then rank deterministically.
     unique = {}
     for topic in topics:
-        if topic.topic_id not in unique: unique[topic.topic_id] = topic
+        if topic.topic_id not in unique:
+            unique[topic.topic_id] = topic
         else:
             # Attribute this merge to the query that supplied the duplicate.
             query_key = topic_origins.get(id(topic))
             if query_key:
                 query_merge_counts[query_key] = query_merge_counts.get(query_key, 0) + 1
             old = unique[topic.topic_id]
+            if ledger is not None:
+                try:
+                    _record_diagnostic_relationship(ledger, {"type": "cross_query_merge", "survivor_topic_id": old.topic_id,
+                        "merged_topic_id": topic.topic_id, "query_id": query_rows.get(
+                            topic_origins.get(id(topic)), {}).get("query_id"),
+                        "survivor_query_id": next((query_rows.get(k, {}).get("query_id") for obj, k in topic_origins.items()
+                                                     if obj == id(old)), None),
+                        "merged_query_id": query_rows.get(topic_origins.get(id(topic)), {}).get("query_id"),
+                        "survivor_ref": {"query_id": next((query_rows.get(k, {}).get("query_id") for obj, k in topic_origins.items()
+                                                              if obj == id(old)), None), "topic_id": old.topic_id},
+                        "merged_ref": {"query_id": query_rows.get(topic_origins.get(id(topic)), {}).get("query_id"),
+                                       "topic_id": topic.topic_id},
+                        "status": "merged"})
+                except Exception as diagnostic_exc:
+                    ledger = None
+                    diagnostics_failure = type(diagnostic_exc).__name__
             merged = {a["url"]: a for a in old.articles + topic.articles}
             old.articles = list(merged.values()); old.claims.extend(topic.claims)
             old.relevant_categories = sorted(set(old.relevant_categories + topic.relevant_categories))
@@ -415,7 +705,8 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
                 if set(topic.relevant_categories) & selected_keys}
     topics = sorted((score_topic(t, weights=weights) for t in eligible.values()),
                     key=lambda t: (-t.score, t.topic_id))
-    shortlist, diversity_reasons = _build_shortlist(topics, coverage)
+    shortlist_events = [] if ledger is not None else None
+    shortlist, diversity_reasons = _build_shortlist(topics, coverage, shortlist_events)
     topics = shortlist + [topic for topic in topics if topic not in shortlist]
     shortlist_ids = {topic.topic_id for topic in shortlist}
     query_exclusions = {key: [topic for topic in exclusions if key in topic_queries.get(topic.topic_id, set())]
@@ -436,6 +727,70 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
         for key in topic_queries.get(topic.topic_id, set()):
             if key in statuses:
                 statuses[key]["topics_after_run_deduplication"] += 1
+    if ledger is not None:
+        try:
+            final_rows = []
+            decision_rows = []
+            for topic_id, topic in unique.items():
+                included = topic_id in eligible
+                origins = [query_rows[k]["query_id"] for k in query_rows
+                           if k in topic_queries.get(topic_id, set())]
+                final_rows.append({"topic_id": topic_id, "query_ids": origins,
+                    "category": topic.category, "relevant_categories": list(topic.relevant_categories),
+                    "category_exclusion_reason": None if included else "no relevant category selected",
+                    "ranking_eligibility": "eligible" if included else "excluded", "score": topic.score,
+                    "verification_status": topic.verification_status,
+                    "duplicate_cluster_relationship": "unavailable"})
+                if not included:
+                    decision_rows.append({"topic_id": topic_id, "candidate_topic_ref": topic_id,
+                        "query_ids": origins,
+                        "shortlist_eligibility": "ineligible_category", "category": topic.category,
+                        "geography_classification": topic.relevance or "unavailable",
+                        "publisher_identities": _diagnostic_publisher_identities(topic),
+                        "publisher_cap_affected_eligibility": "not_applicable",
+                        "geography_balance_affected_selection": "not_applicable",
+                        "selected": "no", "decision_reason": "no_relevant_category_selected",
+                        "ranking_score": topic.score, "ranking_order": None, "selection_order": None,
+                        "constraints": {"selected_categories": sorted(selected_keys),
+                                        "shortlist_size": SHORTLIST_SIZE,
+                                        "publisher_limit": PUBLISHER_SHORTLIST_LIMIT,
+                                        "coverage_mode": coverage}})
+                for candidate in ledger["candidates"]:
+                    if topic_id in candidate["topic_ids"]:
+                        candidate["ranking_eligibility"] = "eligible" if included else "excluded"
+                        candidate["topic_verification"] = [x for x in candidate["topic_verification"]
+                            if x["topic_id"] != topic_id]
+                        candidate["topic_verification"].append({"topic_id": topic_id,
+                            "verification_status": topic.verification_status})
+                        candidate["claim_verification"] = (candidate["topic_verification"][0]["verification_status"]
+                            if len(candidate["topic_verification"]) == 1 else "per_topic")
+            ledger["topics"] = final_rows
+            for decision in shortlist_events:
+                decision["query_ids"] = [query_rows[k]["query_id"] for k in query_rows
+                                          if k in topic_queries.get(decision["topic_id"], set())]
+            decision_rows.extend(shortlist_events)
+            ledger["shortlist_decisions"] = decision_rows
+            for candidate in ledger["candidates"]:
+                if not candidate["topic_ids"]:
+                    candidate["association_state"] = "unmatched" if candidate["association_attempted"] else "unavailable"
+            diagnostics.clear()
+            diagnostics.update(ledger)
+        except Exception as exc:
+            # Diagnostics are optional: report an incomplete ledger where possible without
+            # routing this failure through the research query's production exception path.
+            try:
+                diagnostics.clear()
+                diagnostics.update({"schema_version": 1, "diagnostics_status": "incomplete",
+                                    "diagnostic_failure": diagnostics_failure or type(exc).__name__})
+            except Exception:
+                pass
+    elif diagnostics is not None and diagnostics_failure:
+        try:
+            diagnostics.clear()
+            diagnostics.update({"schema_version": 1, "diagnostics_status": "incomplete",
+                                "diagnostic_failure": diagnostics_failure})
+        except Exception:
+            pass
     return run_id, topics, statuses
 
 
