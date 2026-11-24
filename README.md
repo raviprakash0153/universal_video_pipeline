@@ -126,6 +126,42 @@ access or quality failure, not as verified irrelevance. Routine output gives
 stage counts and concise explanations; `--diagnostic` prints detailed provider
 and rejection diagnostics, and `--verbose` prints all rejection records.
 
+### Phase 5B.6 research quality evaluation
+
+The quality evaluator checks the existing research pipeline locally. Run the
+labelled synthetic fixtures or request detailed diagnostics:
+
+```sh
+python3 research_cli.py evaluate-quality
+python3 research_cli.py evaluate-quality --diagnostic
+python3 research_cli.py evaluate-quality --history
+python3 research_cli.py evaluate-quality --history --db /path/to/pipeline.sqlite3 --run-id <run-id> --diagnostic
+```
+
+The category table counts **synthetic fixture rows** assigned to each category;
+these are not discovered production articles or discovery-funnel counts.
+Historical snapshots do not retain candidate-stage counts, query settings, or
+shortlist selection separately, so those measures are unavailable. No shortlisted topics alone does not establish a discovery
+failure, and unrequested categories are not failures. Geography counts describe
+India/global discovery provenance, not geographic impact. Publisher identity
+uses an original-source URL when recorded; unknown identities remain visible.
+Evidence summaries do not treat multiple URLs as independent corroboration.
+
+Synthetic expected labels are independent from predictions produced by the
+production classifier. Classification reports micro-averaged precision, recall,
+and F1 over category assignments; undefined zero-denominator metrics are shown
+as unavailable. Titles and labels exercise recognized and missed categories,
+verification states, publisher identity, duplicate headlines, and missing data.
+Duplicate and syndication indicators are approximate synthetic fixture checks,
+not production clustering or independent-source verification; URL differences
+do not prove source independence, and unknown identities remain separate. Their
+classification metrics measure only those fixtures and do not demonstrate
+real-world news coverage quality. Historical classification accuracy is
+unavailable because snapshots have no independent ground-truth labels. History
+mode opens SQLite with read-only URI access and does not modify or create the
+database. Evaluation makes
+no network requests, publishes nothing, and sends no messages.
+
 Telegram credentials are read from the shell environment. To enter the token
 without echoing it or placing it in shell history, use:
 

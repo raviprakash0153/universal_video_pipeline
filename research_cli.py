@@ -12,6 +12,7 @@ import uuid
 
 import pipeline_store
 import research_intelligence as intelligence
+import research_quality
 from news_research import (GoogleNewsRSSProvider, MultiSourceNewsProvider,
                            diagnose_production_discovery)
 from research_scheduler import (DEFAULT_CONFIG, LocalScheduler, ScheduleConfig, install_launchd,
@@ -252,6 +253,11 @@ def main(argv=None):
     run.add_argument("--config", default=str(DEFAULT_CONFIG))
     run.add_argument("--db")
     run.add_argument("--send", action="store_true", help="Send the completed briefing to the authorized user")
+    quality = sub.add_parser("evaluate-quality", help="Evaluate synthetic fixture metrics or read-only historical snapshots")
+    quality.add_argument("--history", action="store_true", help="Evaluate persisted snapshots instead of synthetic fixtures")
+    quality.add_argument("--run-id", help="Limit historical evaluation to one run")
+    quality.add_argument("--db", help="SQLite database to read (historical mode)")
+    quality.add_argument("--diagnostic", action="store_true", help="Print detailed metric availability and warnings")
     retry = sub.add_parser("deliver"); retry.add_argument("--run-id", required=True); retry.add_argument("--retry", action="store_true"); retry.add_argument("--db")
     tick = sub.add_parser("schedule-tick", help="Internal one-minute scheduler tick; safe to invoke manually")
     tick.add_argument("--config", default=str(DEFAULT_CONFIG)); tick.add_argument("--db")
@@ -268,6 +274,20 @@ def main(argv=None):
                                  verbose=args.verbose, novelty_lookback_days=args.novelty_lookback_days) else 1
     if args.command == "deliver":
         print(deliver_briefing(args.run_id, db_path=args.db, retry=args.retry)); return 0
+    if args.command == "evaluate-quality":
+        if args.history:
+            path = args.db or pipeline_store.DEFAULT_DATABASE
+            topics, runs = research_quality.load_history(path, args.run_id)
+            if not topics:
+                data = research_quality.evaluate([], source="historical (no snapshots)")
+                data["warnings"].insert(0, "No historical research snapshots were found; no synthetic metrics were substituted.")
+            else:
+                data = research_quality.evaluate(topics, coverage=None, source="historical")
+                data["historical_runs"] = runs
+        else:
+            data = research_quality.evaluate(research_quality.synthetic_fixtures(), source="synthetic")
+        print(research_quality.report(data, detailed=args.diagnostic))
+        return 0
     if args.command == "schedule-tick":
         cfg = load_config(args.config)
         scheduler = LocalScheduler(cfg, db_path=args.db)
