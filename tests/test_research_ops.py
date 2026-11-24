@@ -96,6 +96,27 @@ class DeliveryTests(unittest.TestCase):
 
 
 class ResearchCommandTests(unittest.TestCase):
+    def test_cli_prints_pipeline_diagnostics_and_keeps_verbose_records_gated(self):
+        import research_intelligence as ri
+        status = {"status": "ok", "items": 1, "stage_counts": {
+            "discovered_articles": 1, "rejected_or_inaccessible_articles": 1,
+            "accepted_articles": 0, "clustered_topics": 0, "cross_query_merges": 0,
+            "final_selected_category_exclusions": 0, "final_ranked_shortlist": 0,
+            "category_assignments": {}}, "zero_result_cause":
+            "article access or quality checks rejected candidates (not evidence of irrelevance): article-extraction",
+            "metrics": {"articles_rejected": [{"stage": "article-extraction",
+                "rejection_reason": "publisher unavailable", "headline": "Story"}]}}
+        normal = io.StringIO()
+        with redirect_stdout(normal):
+            research_cli._print_status("run", [], {"science:science": status})
+        self.assertIn("discovered=1", normal.getvalue())
+        self.assertIn("not evidence of irrelevance", normal.getvalue())
+        self.assertNotIn("publisher unavailable", normal.getvalue())
+        detailed = io.StringIO()
+        with redirect_stdout(detailed):
+            research_cli._print_status("run", [], {"science:science": status}, diagnostic=True)
+        self.assertIn("publisher unavailable", detailed.getvalue())
+
     def test_preview_runs_research_without_saving_or_sending(self):
         import research_intelligence as ri
         with tempfile.TemporaryDirectory() as tmp:

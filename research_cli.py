@@ -18,18 +18,30 @@ from research_scheduler import (DEFAULT_CONFIG, LocalScheduler, ScheduleConfig, 
     load_config, next_run, remove_launchd, save_config, validate_config, write_plist)
 
 
-def _print_status(run_id, topics, statuses, *, verbose=False):
+def _print_status(run_id, topics, statuses, *, verbose=False, diagnostic=False):
     print(f"Research run: {run_id}")
     for key, value in statuses.items():
         print(f"Provider/query {key}: {value['status']} ({value.get('items', 0)} items)"
               + (f" — {value.get('error')}" if value.get('error') else ""))
-        for name, diagnostic in value.get("metrics", {}).get("discovery_diagnostics", {}).items():
-            print(f"  {name}: {diagnostic.get('status')} ({diagnostic.get('results_parsed', 0)} results; "
-                  f"{diagnostic.get('elapsed_seconds', 0):.1f}s)"
-                  + (f" — {diagnostic.get('failure_stage')}: {diagnostic.get('safe_exception_detail')}"
-                     if diagnostic.get("safe_exception_detail") else ""))
+        stages = value.get("stage_counts", {})
+        if stages:
+            print("  Pipeline: " + ", ".join(f"{label}={stages[key]}" for key, label in (
+                ("discovered_articles", "discovered"), ("rejected_or_inaccessible_articles", "rejected/inaccessible"),
+                ("accepted_articles", "accepted"), ("clustered_topics", "clustered"),
+                ("cross_query_merges", "cross-query merges"), ("final_selected_category_exclusions", "category exclusions"),
+                ("final_ranked_shortlist", "shortlist"))))
+        if value.get("diversity_adjustments"):
+            print("  Diversity: " + "; ".join(value["diversity_adjustments"]))
+        if value.get("zero_result_cause"):
+            print("  Zero-result cause: " + value["zero_result_cause"])
+        if diagnostic:
+            for name, probe in value.get("metrics", {}).get("discovery_diagnostics", {}).items():
+                print(f"  {name}: {probe.get('status')} ({probe.get('results_parsed', 0)} results; "
+                      f"{probe.get('elapsed_seconds', 0):.1f}s)"
+                      + (f" — {probe.get('failure_stage')}: {probe.get('safe_exception_detail')}"
+                         if probe.get("safe_exception_detail") else ""))
         metrics = value.get("metrics", {})
-        resolution = metrics.get("google_url_resolution")
+        resolution = metrics.get("google_url_resolution") if (diagnostic or verbose) else None
         if resolution:
             print(f"  Google News URL resolution: {resolution.get('attempted', 0)} attempted; "
                   f"{resolution.get('skipped_budget', 0)} skipped by run limit; "
@@ -40,10 +52,11 @@ def _print_status(run_id, topics, statuses, *, verbose=False):
         grouped_reason = Counter(item.get("rejection_reason", "unknown reason") for item in rejected)
         grouped_publisher = Counter(item.get("publisher") or "Unknown publisher" for item in rejected)
         discovered = metrics.get("results_received", 0)
-        print(f"  Total discovered: {discovered}; accepted: {max(0, discovered - sum(1 for x in rejected if x.get('stage') == 'discovery-quality'))}; "
-              f"rejected: {len(rejected)}; "
-              f"verification: {json.dumps(metrics.get('verification_outcomes', {}), sort_keys=True)}")
-        if rejected:
+        if diagnostic or verbose:
+            print(f"  Total discovered: {discovered}; accepted: {max(0, discovered - sum(1 for x in rejected if x.get('stage') == 'discovery-quality'))}; "
+                  f"rejected: {len(rejected)}; "
+                  f"verification: {json.dumps(metrics.get('verification_outcomes', {}), sort_keys=True)}")
+        if rejected and (diagnostic or verbose):
             print("  Rejections by reason: " + json.dumps(dict(grouped_reason.most_common()), ensure_ascii=False))
             print("  Rejections by publisher: " + json.dumps(dict(grouped_publisher.most_common()), ensure_ascii=False))
             shown = rejected if verbose else [item for reason in grouped_reason
@@ -53,7 +66,7 @@ def _print_status(run_id, topics, statuses, *, verbose=False):
                       f"{item.get('publisher') or 'Unknown publisher'}: {item.get('headline') or item.get('url')}")
             if not verbose and len(shown) < len(rejected):
                 print(f"  Rejection samples shown: {len(shown)} of {len(rejected)} (use --verbose for all)")
-        for name, failure in metrics.get("provider_errors", {}).items():
+        for name, failure in (metrics.get("provider_errors", {}).items() if (diagnostic or verbose) else []):
             if failure.get("safe_exception_detail"):
                 print(f"  Provider error {name}: {failure.get('failure_stage')}: {failure['safe_exception_detail']}")
     print(f"Discovered topics: {len(topics)}")
@@ -124,7 +137,7 @@ def run_research(*, config: ScheduleConfig | None = None, categories=None, cover
         run_id, topics, statuses = intelligence.discover_topics(provider=provider, categories=selected,
             coverage=coverage, progress=progress)
         intelligence.classify_novelty(topics, db_path=db_path, lookback_days=novelty_lookback_days)
-        _print_status(run_id, topics, statuses, verbose=verbose)
+        _print_status(run_id, topics, statuses, verbose=verbose, diagnostic=diagnostic)
         if diagnostic:
             print("Diagnostic pipeline detail (discovery, extraction, verification, and clustering):")
             print(json.dumps(statuses, indent=2, ensure_ascii=False, default=str))
@@ -233,7 +246,7 @@ def main(argv=None):
     run.add_argument("--novelty-lookback-days", type=int, default=intelligence.DEFAULT_NOVELTY_LOOKBACK_DAYS,
                      help="Maximum age in days for historical story matching (default: 7)")
     run.add_argument("--diagnostic", action="store_true")
-    run.add_argument("--verbose", action="store_true", help="Print every rejected record")
+    run.add_argument("--verbose", action="store_true", help="Print detailed query diagnostics and every rejected record")
     run.add_argument("--category", action="append", choices=sorted(intelligence.CATEGORIES))
     run.add_argument("--coverage", choices=("india", "global", "india_and_global"))
     run.add_argument("--config", default=str(DEFAULT_CONFIG))

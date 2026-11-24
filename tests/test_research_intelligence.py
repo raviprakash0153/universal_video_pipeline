@@ -12,6 +12,141 @@ from news_research import Article, NewsItem
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_technology_category_recall_and_precision(self):
+        positive = {
+            "Processor maker announces new server processor": "technology_ai",
+            "Semiconductor company expands chip production": "technology_ai",
+            "Data center operator adds robotics to network": "technology_ai",
+            "Software firm reports cybersecurity breach": "technology_ai",
+            "Artificial intelligence system improves cloud computing": "technology_ai",
+        }
+        for headline, expected in positive.items():
+            with self.subTest(headline=headline):
+                self.assertEqual(ri._category_for(headline), expected)
+        for headline in ("Food processor recalled after safety complaints",
+                         "Technology changes the way artists tell stories"):
+            with self.subTest(headline=headline):
+                self.assertNotEqual(ri._category_for(headline), "technology_ai")
+
+    def test_selected_categories_keep_mixed_topics_but_exclude_unselected_only(self):
+        class Provider:
+            def search(self, query):
+                headline = "Scientists use AI software to study climate patterns"
+                return [Article("https://research.test/story", "Research Desk", headline,
+                                "2026-11-22T10:00:00+00:00")]
+            def open(self, article):
+                return Article(article.url, article.publisher, article.headline, article.publication_date,
+                               evidence="Accessible research details.")
+        _, science_topics, _ = ri.discover_topics(provider=Provider(), categories={"science": ("science",)}, coverage="global")
+        self.assertEqual(len(science_topics), 1)
+        self.assertIn("technology_ai", science_topics[0].relevant_categories)
+        _, gaming_topics, _ = ri.discover_topics(provider=Provider(), categories={"gaming": ("gaming",)}, coverage="global")
+        self.assertEqual(gaming_topics, [])
+
+    def test_india_global_shortlist_balances_available_geographies(self):
+        topics = [ri.Topic(str(i), f"Story {i}", "s", "science", geo, score=100-i,
+                           articles=[{"publisher": f"Outlet {i}"}])
+                  for i, geo in enumerate(("global", "global", "global", "india", "india"))]
+        selected, reasons = ri._build_shortlist(topics, "india_and_global")
+        self.assertIn("india", {topic.relevance for topic in selected})
+        self.assertIn("global", {topic.relevance for topic in selected})
+        self.assertIn("geography balancing changed shortlist", reasons)
+
+    def test_one_geography_only_is_not_fabricated_or_excluded(self):
+        topics = [ri.Topic(str(i), f"Story {i}", "s", "science", "india", score=10-i) for i in range(3)]
+        selected, reasons = ri._build_shortlist(topics, "india_and_global")
+        self.assertEqual(selected, topics)
+        self.assertEqual(reasons, [])
+
+    def test_publisher_limit_prefers_alternatives_and_relaxes_when_needed(self):
+        topics = [ri.Topic(str(i), f"Story {i}", "s", "science", "global", score=110-i,
+                           articles=[{"publisher": "Same"}]) for i in range(11)]
+        topics.extend(ri.Topic(f"alt{i}", f"Alternative {i}", "s", "science", "global", score=80-i,
+                               articles=[{"publisher": f"Other {i}"}]) for i in range(10))
+        selected, reasons = ri._build_shortlist(topics, "global")
+        self.assertTrue(any(t.topic_id.startswith("alt") for t in selected))
+        self.assertIn("publisher concentration limit changed shortlist", reasons)
+        self.assertLessEqual(sum(t.articles[0]["publisher"] == "Same" for t in selected), 2)
+        only_same, fallback = ri._build_shortlist(topics[:4], "global")
+        self.assertEqual(len(only_same), 4)
+        self.assertIn("publisher limit relaxed: no alternative eligible story", fallback)
+
+    def test_syndicated_copies_share_publisher_identity(self):
+        original = {"publisher": "Reuters", "url": "https://reuters.test/a",
+                    "original_source_url": "https://reuters.test/a"}
+        copy = {"publisher": "Local News", "url": "https://local.test/a",
+                "original_source_url": "https://reuters.test/a"}
+        self.assertEqual(ri._publisher_identity(original), ri._publisher_identity(copy))
+
+    def test_zero_result_diagnostics_identify_distinct_pipeline_stages(self):
+        status = {"stage_counts": {"discovered_articles": 0, "accepted_articles": 0,
+                    "clustered_topics": 0, "final_ranked_shortlist": 0}, "metrics": {}}
+        self.assertEqual(ri._zero_result_cause(status, []), "discovery returned no articles")
+        status["stage_counts"]["discovered_articles"] = 2
+        status["metrics"] = {"articles_rejected": [{"stage": "article-extraction"}]}
+        self.assertIn("not evidence of irrelevance", ri._zero_result_cause(status, []))
+        status["stage_counts"]["accepted_articles"] = 1
+        status["stage_counts"]["clustered_topics"] = 1
+        self.assertEqual(ri._zero_result_cause(status, [ri.Topic("x", "x", "s", "gaming", "global")]),
+                         "topics were relevant only to unselected categories")
+
+    def test_query_diagnostics_attribute_exclusions_merges_and_shortlist_locally(self):
+        from types import SimpleNamespace
+
+        # Both synthetic queries produce one deterministic cluster. A's topic
+        # is excluded; B's eligible topic ranks outside the mocked shortlist.
+        topics = {
+            "science:query A": [ri.Topic("a", "A story", "s", "science", "global",
+                                          score=1, relevant_categories=["sports"])],
+            "science:query B": [ri.Topic("b", "B story", "s", "science", "global",
+                                          score=1, relevant_categories=["science"])],
+        }
+        reports = {key: SimpleNamespace(items=[], metrics={"results_received": 1,
+                    "accessible_articles": 1, "articles_rejected": []}) for key in topics}
+        call = {"index": 0}
+
+        def fake_research_news(query, **kwargs):
+            key = "science:query A" if "query A" in query else "science:query B"
+            return reports[key]
+
+        def fake_cluster(items, *, category, relevance):
+            call["index"] += 1
+            key = "science:query A" if call["index"] == 1 else "science:query B"
+            return topics[key]
+
+        with patch.object(ri, "research_news", side_effect=fake_research_news), \
+             patch.object(ri, "cluster_report_items", side_effect=fake_cluster), \
+             patch.object(ri, "_build_shortlist", return_value=([], [])):
+            # A's topic is ineligible, B's topic is eligible but not selected.
+            _, _, statuses = ri.discover_topics(
+                categories={"science": ("query A", "query B")}, queries_per_category=2, coverage="global")
+
+        a = statuses["science:query A"]
+        b = statuses["science:query B"]
+        self.assertEqual(a["stage_counts"]["final_selected_category_exclusions"], 1)
+        self.assertEqual(b["stage_counts"]["final_selected_category_exclusions"], 0)
+        self.assertEqual(a["zero_result_cause"], "topics were relevant only to unselected categories")
+        self.assertIn("shortlist", b["zero_result_cause"])
+        self.assertEqual(b["stage_counts"]["cross_query_merges"], 0)
+        self.assertEqual(a["stage_counts"]["cross_query_merges"], 0)
+
+    def test_cross_query_merges_are_charged_only_to_query_with_duplicate(self):
+        from types import SimpleNamespace
+
+        duplicate = lambda: ri.Topic("same", "Shared story", "s", "science", "global",
+                                     score=1, relevant_categories=["science"])
+        reports = [SimpleNamespace(items=[], metrics={"results_received": 1,
+                   "accessible_articles": 1, "articles_rejected": []}) for _ in range(3)]
+        produced = [[duplicate()], [duplicate()],
+                    [ri.Topic("other", "Other story", "s", "science", "global",
+                              score=1, relevant_categories=["science"])]]
+        with patch.object(ri, "research_news", side_effect=reports), \
+             patch.object(ri, "cluster_report_items", side_effect=produced):
+            _, _, statuses = ri.discover_topics(
+                categories={"science": ("first", "second", "third")}, queries_per_category=3, coverage="global")
+        counts = [status["stage_counts"]["cross_query_merges"] for status in statuses.values()]
+        self.assertEqual(counts, [0, 1, 0])
+
     def test_cross_run_novelty_matches_headline_rewrite_and_keeps_evidence_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "research.db"

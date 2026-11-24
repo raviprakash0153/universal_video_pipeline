@@ -37,6 +37,8 @@ _STOP = {"with", "from", "that", "this", "have", "after", "into", "over", "will"
          "says", "said", "about", "their", "your", "what", "when", "where", "than",
          "india", "today", "new", "launches", "announces", "reports", "report", "reveals", "update"}
 DEFAULT_NOVELTY_LOOKBACK_DAYS = 7
+SHORTLIST_SIZE = 10
+PUBLISHER_SHORTLIST_LIMIT = 2
 
 
 @dataclass
@@ -151,7 +153,10 @@ def cluster_report_items(items, *, category="uncategorized", relevance="global")
                    "uncertain": i.uncertain, "disagreement": i.disagreement,
                    "evidence_urls": [_article_dict(a)["url"] for a in i.sources if a.evidence]} for i in group]
         primary_category = _category_for(headline) or category
-        relevant = sorted(({category, primary_category} | _categories_for(headline)) - {"uncategorized"})
+        classified = _categories_for(headline)
+        if _category_for(headline):
+            classified.add(primary_category)
+        relevant = sorted(classified or ({category} if category != "uncategorized" else set()))
         result.append(Topic("topic-" + digest, headline, group[0].confirmed or group[0].uncertain or
                             "Publisher pages were inspected; see claim evidence and uncertainty below.",
                             primary_category, relevance, list(articles_by_url.values()), claims, status,
@@ -218,10 +223,12 @@ def _category_for(topic: str) -> str:
     scores = {}
     for category, terms in CATEGORIES.items():
         matches = set().union(*(_tokens(term) for term in terms)) & tokens
+        if category == "technology_ai" and matches <= {"technology"}:
+            matches = set()
         if matches:
             scores[category] = len(matches)
     for category, pattern in {
-        "technology_ai": r"\b(ai|artificial intelligence|software|chip|semiconductor|technology|tech)\b",
+        "technology_ai": r"\b(ai|artificial intelligence|machine learning|deep learning|software|cybersecurity|cyber security|processor|processors|chip|chips|semiconductor|data cent(?:er|re)s?|robotics?|automation|cloud computing|operating system|database|networking|quantum computing)\b",
         "science": r"\b(science|scientists?|study|research(?:er)?s?|discover(?:y|ies|s|ed)?|climate|space|planet|species)\b",
         "gaming": r"\b(game|gaming|xbox|playstation|nintendo|steam|gta|grand theft auto|video game)\b",
         "business_economy": r"\b(stocks?|market|economy|earnings|revenue|trade|jobs|inflation)\b",
@@ -230,6 +237,11 @@ def _category_for(topic: str) -> str:
         "entertainment": r"\b(film|movie|actor|actress|music|singer|celebrity|box office)\b",
     }.items():
         if re.search(pattern, text): scores[category] = scores.get(category, 0) + 2
+    if re.search(r"\bprocessors?\b", text) and not re.search(
+            r"\b(computer|computing|intel|amd|chip|semiconductor|data center|server|silicon)\b", text):
+        scores["technology_ai"] = max(0, scores.get("technology_ai", 0) - 2)
+        if not scores["technology_ai"]:
+            scores.pop("technology_ai", None)
     # A gaming title or platform is an explicit signal; a generic mention of
     # "game" in technology coverage is not enough to override stronger topics.
     return max(scores, key=scores.get) if scores else None
@@ -245,8 +257,10 @@ def _categories_for(topic: str) -> set[str]:
             result.add(category)
         elif category == "science" and re.search(r"\b(science|scientists?|study|research|discovery|discover|space|climate|species|planet)\b", text):
             result.add(category)
-        elif category == "technology_ai" and re.search(r"\b(technology|tech|artificial intelligence|AI|software|chip|semiconductor)\b", topic, re.I):
-            result.add(category)
+        elif category == "technology_ai" and re.search(r"\b(ai|artificial intelligence|machine learning|deep learning|software|cybersecurity|cyber security|processor|processors|chip|chips|semiconductor|data cent(?:er|re)s?|robotics?|automation|cloud computing|operating system|database|networking|quantum computing)\b", topic, re.I):
+            if not (re.search(r"\bprocessors?\b", text) and not re.search(
+                    r"\b(computer|computing|intel|amd|chip|semiconductor|data center|server|silicon)\b", text)):
+                result.add(category)
         elif category == "business_economy" and re.search(r"\b(business|economy|market|earnings|revenue|jobs|inflation|creator economy|monetization)\b", text):
             result.add(category)
         elif category == "entertainment" and re.search(r"\b(film|movie|actor|actress|music|singer|celebrity|box office)\b", text):
@@ -256,6 +270,66 @@ def _categories_for(topic: str) -> set[str]:
     return result
 
 
+def _publisher_identity(article: dict) -> str:
+    """Use the original outlet when known, collapsing syndicated copies."""
+    origin = article.get("original_source_url")
+    host = (urlparse(origin).hostname or "").casefold() if origin else ""
+    if host:
+        return host.removeprefix("www.")
+    publisher = re.sub(r"\s+", " ", (article.get("publisher") or "").casefold()).strip()
+    return publisher or (urlparse(article.get("url") or "").hostname or "unknown").removeprefix("www.")
+
+
+def _build_shortlist(topics: list[Topic], coverage: str) -> tuple[list[Topic], list[str]]:
+    """Apply deterministic geography and publisher limits to the ranked top ten."""
+    pool = list(topics)
+    if not pool:
+        return [], []
+    reasons = []
+    target = min(SHORTLIST_SIZE, len(pool))
+    both_geos = coverage == "india_and_global" and {t.relevance for t in pool} >= {"india", "global"}
+    geo_counts = {"india": 0, "global": 0}
+    publisher_counts = {}
+    selected = []
+    remaining = list(pool)
+    publisher_changed = False
+    while remaining and len(selected) < target:
+        slots = target - len(selected)
+        eligible = [t for t in remaining if all(
+            publisher_counts.get(_publisher_identity(a), 0) < PUBLISHER_SHORTLIST_LIMIT
+            for a in t.articles)]
+        if not eligible:
+            eligible = remaining
+            if "publisher limit relaxed: no alternative eligible story" not in reasons:
+                reasons.append("publisher limit relaxed: no alternative eligible story")
+        if both_geos and slots >= 2:
+            need = {geo for geo in ("india", "global") if geo_counts[geo] == 0}
+            choices = [t for t in eligible if t.relevance in need]
+            if not choices:
+                choices = [t for t in remaining if t.relevance in need]
+                if choices and "publisher limit relaxed to include available geography" not in reasons:
+                    reasons.append("publisher limit relaxed to include available geography")
+            if choices:
+                if "geography balancing changed shortlist" not in reasons:
+                    reasons.append("geography balancing changed shortlist")
+                chosen = choices[0]
+            else:
+                chosen = eligible[0]
+        else:
+            chosen = eligible[0]
+        if any(t not in eligible and t.score > chosen.score for t in remaining):
+            publisher_changed = True
+        selected.append(chosen)
+        remaining.remove(chosen)
+        if chosen.relevance in geo_counts:
+            geo_counts[chosen.relevance] += 1
+        for identity in {_publisher_identity(a) for a in chosen.articles}:
+            publisher_counts[identity] = publisher_counts.get(identity, 0) + 1
+    if publisher_changed:
+        reasons.append("publisher concentration limit changed shortlist")
+    return selected, reasons
+
+
 def discover_topics(*, provider=None, categories: dict | None = None, queries_per_category=1,
                     weights: dict | None = None, coverage="india_and_global", progress=None) -> tuple[str, list[Topic], dict]:
     """Run configurable free-source queries then inspect and rank candidate stories."""
@@ -263,6 +337,9 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
     selected = categories or CATEGORIES
     run_id = sha256(datetime.now(timezone.utc).isoformat().encode()).hexdigest()[:24]
     topics, statuses = [], {}
+    topic_queries = {}
+    topic_origins = {}
+    query_merge_counts = {}
     for category, queries in selected.items():
         for query in list(queries)[:queries_per_category]:
             # Separate India and worldwide discovery so a strong global result
@@ -276,13 +353,30 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
                     before = len(report.items)
                     discovered_topics = cluster_report_items(report.items, category=category, relevance=relevance)
                     discovered_topics = [score_topic(topic, weights=weights) for topic in discovered_topics]
+                    metrics = report.metrics
+                    rejected = metrics.get("articles_rejected", [])
+                    accepted_count = metrics.get("accessible_articles", sum(
+                        1 for item in report.items for article in item.sources if article.accessible and article.evidence))
                     statuses[key] = {"status": "ok", "items": before, "topics_before_clustering": before,
                                      "topics_after_clustering": len(discovered_topics),
                                      "category_classification_counts": dict(__import__("collections").Counter(
                                          topic.category for topic in discovered_topics)),
                                      "recommendation_eligible": sum(t.recommendation_eligible for t in discovered_topics),
-                                     "metrics": report.metrics}
+                                     "stage_counts": {
+                                         "discovered_articles": metrics.get("results_received", before),
+                                         "rejected_or_inaccessible_articles": len(rejected),
+                                         "accepted_articles": accepted_count,
+                                         "clustered_topics": len(discovered_topics),
+                                         "cross_query_merges": 0,
+                                         "category_assignments": dict(__import__("collections").Counter(
+                                             t.category for t in discovered_topics)),
+                                         "final_selected_category_exclusions": 0,
+                                         "final_ranked_shortlist": 0},
+                                     "metrics": metrics}
                     topics.extend(discovered_topics)
+                    for topic in discovered_topics:
+                        topic_queries.setdefault(topic.topic_id, set()).add(key)
+                        topic_origins[id(topic)] = key
                 except Exception as exc:
                     from news_research import _safe_provider_failure
                     statuses[key] = {"status": "failed", "error_type": type(exc).__name__,
@@ -294,30 +388,79 @@ def discover_topics(*, provider=None, categories: dict | None = None, queries_pe
     for topic in topics:
         if topic.topic_id not in unique: unique[topic.topic_id] = topic
         else:
+            # Attribute this merge to the query that supplied the duplicate.
+            query_key = topic_origins.get(id(topic))
+            if query_key:
+                query_merge_counts[query_key] = query_merge_counts.get(query_key, 0) + 1
             old = unique[topic.topic_id]
             merged = {a["url"]: a for a in old.articles + topic.articles}
             old.articles = list(merged.values()); old.claims.extend(topic.claims)
-            old.relevant_categories = sorted(set(old.relevant_categories + topic.relevant_categories + [topic.category]))
-            old.category = _category_for(old.headline) or old.category
+            old.relevant_categories = sorted(set(old.relevant_categories + topic.relevant_categories))
+            primary = _category_for(old.headline)
+            classified = _categories_for(old.headline)
+            if primary:
+                classified.add(primary)
+            old.category = primary or old.category
+            old.relevant_categories = sorted(classified or set(old.relevant_categories))
             old.relevance = ("india_and_global" if {old.relevance, topic.relevance} == {"india", "global"}
                              else old.relevance)
             if "DISPUTED" in {old.verification_status, topic.verification_status} or "CONFLICTING" in {
                     old.verification_status, topic.verification_status}:
                 old.verification_status = "CONFLICTING"
             score_topic(old, weights=weights)
-    # Query fallback categories are useful when a headline is genuinely
-    # ambiguous, but must not cause unrelated topics to leak into the result.
     selected_keys = set(selected)
-    unique = {key: topic for key, topic in unique.items() if topic.category in selected_keys}
-    topics = sorted((score_topic(t, weights=weights) for t in unique.values()),
+    exclusions = [topic for topic in unique.values()
+                  if not (set(topic.relevant_categories) & selected_keys)]
+    eligible = {key: topic for key, topic in unique.items()
+                if set(topic.relevant_categories) & selected_keys}
+    topics = sorted((score_topic(t, weights=weights) for t in eligible.values()),
                     key=lambda t: (-t.score, t.topic_id))
-    for status in statuses.values():
+    shortlist, diversity_reasons = _build_shortlist(topics, coverage)
+    topics = shortlist + [topic for topic in topics if topic not in shortlist]
+    shortlist_ids = {topic.topic_id for topic in shortlist}
+    query_exclusions = {key: [topic for topic in exclusions if key in topic_queries.get(topic.topic_id, set())]
+                        for key in statuses}
+    query_eligible = {key: [topic for topic in eligible.values()
+                            if key in topic_queries.get(topic.topic_id, set())]
+                      for key in statuses}
+    for key, status in statuses.items():
         status.setdefault("topics_after_run_deduplication", 0)
+        status["stage_counts"]["cross_query_merges"] = query_merge_counts.get(key, 0)
+        status["stage_counts"]["final_selected_category_exclusions"] = len(query_exclusions[key])
+        status["stage_counts"]["final_ranked_shortlist"] = sum(
+            topic.topic_id in shortlist_ids and key in topic_queries.get(topic.topic_id, set()) for topic in topics)
+        status["diversity_adjustments"] = diversity_reasons
+        if status.get("status") == "ok":
+            status["zero_result_cause"] = _zero_result_cause(status, query_exclusions[key], query_eligible[key])
     for topic in topics:
-        matching = [s for key, s in statuses.items() if key.split(":", 1)[0] in topic.relevant_categories]
-        if matching:
-            matching[0]["topics_after_run_deduplication"] += 1
+        for key in topic_queries.get(topic.topic_id, set()):
+            if key in statuses:
+                statuses[key]["topics_after_run_deduplication"] += 1
     return run_id, topics, statuses
+
+
+def _zero_result_cause(status: dict, exclusions: list[Topic], eligible_topics: list[Topic] | None = None) -> str | None:
+    counts = status["stage_counts"]
+    metrics = status.get("metrics", {})
+    if counts["discovered_articles"] == 0:
+        return ("discovery failed or provider unavailable" if
+                metrics.get("search_errors") or metrics.get("provider_errors")
+                else "discovery returned no articles")
+    if counts["accepted_articles"] == 0:
+        stages = {row.get("stage") for row in metrics.get("articles_rejected", [])}
+        return "article access or quality checks rejected candidates (not evidence of irrelevance): " + (
+            ", ".join(sorted(stages)) or "no accessible evidence")
+    if counts["clustered_topics"] == 0:
+        return "no accessible report items could be clustered"
+    if counts["final_ranked_shortlist"]:
+        return None
+    if exclusions:
+        if eligible_topics:
+            return "eligible topics did not reach the final shortlist after ranking"
+        return "topics were relevant only to unselected categories"
+    if eligible_topics:
+        return "eligible topics did not reach the final shortlist after ranking"
+    return "no topic remained after clustering and ranking"
 
 
 def persist_research(run_id: str, topics: list[Topic], source_status: dict, *, db_path=None) -> None:

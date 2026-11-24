@@ -97,6 +97,35 @@ default 0) to tune bounded requests. Missing dates and stale stories are exclude
 from latest research; publisher access failures and verification uncertainty
 remain visible in the per-query metrics and saved snapshots.
 
+Research categories use headline subject signals. Political and legal proceedings
+take precedence over incidental technology or science mentions, and international
+conflicts take precedence over other subjects. Technology coverage includes
+processors, chips, semiconductors, data centers, robotics, software,
+cybersecurity, AI, and related computing terms. Generic mentions of
+“technology” alone do not qualify. A topic is eligible when at least one of its
+classified `relevant_categories` is selected; a mixed-category story can qualify
+through any selected category, while a story relevant only to unselected
+categories is removed after cross-query merging.
+
+The final shortlist is the first ten ranked topics. For
+`--coverage india_and_global`, it includes India and global discovery results
+when both have eligible topics, with score order adjusted only as needed to
+include both. These labels describe the query that found a story; they do not
+verify the story’s geographic impact. A single available geography remains
+eligible without an invented counterpart. The shortlist limits each publisher
+identity to two topics when alternatives exist. Original-source URLs identify
+syndicated copies as one publisher; the limit relaxes when no eligible
+alternative remains. CLI output reports when either diversity rule changes the
+shortlist. No additional configuration is required.
+
+Each query tracks discovered articles, rejected or inaccessible articles,
+accepted evidence, clustered topics, cross-query merges, category assignments,
+selected-category exclusions, and the final shortlist. A zero-result explanation
+identifies the stage where results stopped. Inaccessibility is reported as an
+access or quality failure, not as verified irrelevance. Routine output gives
+stage counts and concise explanations; `--diagnostic` prints detailed provider
+and rejection diagnostics, and `--verbose` prints all rejection records.
+
 Telegram credentials are read from the shell environment. To enter the token
 without echoing it or placing it in shell history, use:
 
