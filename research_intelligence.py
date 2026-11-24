@@ -36,6 +36,7 @@ DEFAULT_WEIGHTS = {"freshness": .20, "interest": .10, "relevance": .15,
 _STOP = {"with", "from", "that", "this", "have", "after", "into", "over", "will",
          "says", "said", "about", "their", "your", "what", "when", "where", "than",
          "india", "today", "new", "launches", "announces", "reports", "report", "reveals", "update"}
+DEFAULT_NOVELTY_LOOKBACK_DAYS = 7
 
 
 @dataclass
@@ -54,6 +55,8 @@ class Topic:
     relevant_categories: list[str] = field(default_factory=list)
     recommendation_eligible: bool = False
     recommendation_reason: str = "Not assessed"
+    novelty_status: str = "NEW"
+    previous_coverage: list[dict] = field(default_factory=list)
 
 
 def _tokens(text: str) -> set[str]:
@@ -82,7 +85,11 @@ def _similar(a: str, b: str) -> bool:
     left = {aliases.get(token, token) for token in left}
     right = {aliases.get(token, token) for token in right}
     overlap = len(left & right) / min(len(left), len(right))
-    return overlap >= .50 and len(left & right) >= 2
+    shared = left & right
+    # Two-word headlines and generic overlaps are too ambiguous for cross-run
+    # identity. Keep within-run clustering behavior stable; apply this stricter
+    # rule only to historical comparisons below.
+    return overlap >= .50 and len(shared) >= 2
 
 
 def _article_dict(article) -> dict:
@@ -339,6 +346,7 @@ def persist_research(run_id: str, topics: list[Topic], source_status: dict, *, d
         CREATE TABLE IF NOT EXISTS topic_selections(selection_id TEXT PRIMARY KEY, briefing_id TEXT,
           topic_id TEXT, custom_topic TEXT, user_id TEXT NOT NULL, selected_at TEXT NOT NULL, snapshot_json TEXT NOT NULL);
         """)
+        _classify_novelty(db, topics, exclude_run_id=run_id)
         with db:
             db.execute("INSERT OR IGNORE INTO research_runs VALUES(?,?,?)", (run_id, datetime.now(timezone.utc).isoformat(), json.dumps(source_status, sort_keys=True)))
             for source_key, status in source_status.items():
@@ -365,6 +373,139 @@ def persist_research(run_id: str, topics: list[Topic], source_status: dict, *, d
     finally: db.close()
 
 
+def classify_novelty(topics: list[Topic], *, db_path=None,
+                     lookback_days: int = DEFAULT_NOVELTY_LOOKBACK_DAYS) -> None:
+    """Apply persisted cross-run novelty to a preview or a saved run."""
+    db = pipeline_store.connect(db_path or pipeline_store.DEFAULT_DATABASE)
+    try:
+        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_runs'").fetchone()
+        if exists:
+            _classify_novelty(db, topics, lookback_days=lookback_days)
+        else:
+            for topic in topics:
+                topic.novelty_status = "NEW"
+                topic.previous_coverage = []
+    finally:
+        db.close()
+
+
+def _parse_timestamp(value):
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _classify_novelty(db, topics: list[Topic], exclude_run_id=None, *,
+                      lookback_days: int = DEFAULT_NOVELTY_LOOKBACK_DAYS, reference_time=None) -> None:
+    """Classify against earlier immutable snapshots, independently of evidence."""
+    previous = db.execute("""SELECT r.run_id,r.created_at,t.snapshot_json
+      FROM research_runs r JOIN research_topics t USING(run_id)
+      ORDER BY r.created_at DESC""").fetchall()
+    reference = _parse_timestamp(reference_time) if reference_time else datetime.now(timezone.utc)
+    try:
+        cutoff = reference.timestamp() - max(0, float(lookback_days)) * 86400
+    except (TypeError, ValueError, OverflowError):
+        cutoff = reference.timestamp() - DEFAULT_NOVELTY_LOOKBACK_DAYS * 86400
+    earlier = []
+    for row in previous:
+        if row["run_id"] == exclude_run_id:
+            continue
+        created = _parse_timestamp(row["created_at"])
+        if not created or created > reference or created.timestamp() < cutoff:
+            continue
+        try:
+            snapshot = json.loads(row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("headline"), str):
+            continue
+        articles = snapshot.get("articles", [])
+        if not isinstance(articles, list):
+            continue
+        snapshot["articles"] = [a for a in articles if isinstance(a, dict)]
+        earlier.append((row["run_id"], row["created_at"], snapshot))
+    for topic in topics:
+        topic.previous_coverage = _previous_coverage(topic, earlier)
+        if not topic.previous_coverage:
+            topic.novelty_status = "NEW"
+        else:
+            topic.novelty_status = ("MEANINGFUL_UPDATE" if _has_newer_coverage(topic, topic.previous_coverage)
+                                    else "PREVIOUSLY_COVERED")
+
+
+def _previous_coverage(topic: Topic, earlier: list[tuple[str, str, dict]]) -> list[dict]:
+    """Find conservative earlier matches and return brief provenance details."""
+    matches = []
+    current_articles = [a for a in topic.articles if isinstance(a, dict)]
+    current_urls = {value for article in current_articles for value in
+                    (article.get("url"), article.get("original_source_url")) if value}
+    for run_id, created_at, snapshot in earlier:
+        headline = snapshot.get("headline", "")
+        old_articles = snapshot.get("articles", [])
+        old_urls = {value for article in old_articles if isinstance(article, dict) for value in
+                    (article.get("url"), article.get("original_source_url")) if value}
+        headline_match = _strong_story_match(topic.headline, headline)
+        current_tokens, old_tokens = _tokens(topic.headline), _tokens(headline)
+        url_match = (bool(current_urls & old_urls) and len(current_tokens) >= 3 and
+                     len(old_tokens) >= 3 and len(current_tokens & old_tokens) >= 2)
+        if not (headline_match or url_match):
+            continue
+        matches.append({"run_id": run_id, "covered_at": created_at, "headline": headline,
+                        "articles": [{"publisher": a.get("publisher"), "url": a.get("url"),
+                                      "original_source_url": a.get("original_source_url"),
+                                      "publication_date": a.get("publication_date"),
+                                      "retrieved_at": a.get("retrieved_at"),
+                                      "headline": a.get("headline"), "evidence": a.get("evidence"),
+                                      "primary": a.get("primary") is True}
+                                     for a in old_articles[:5] if isinstance(a, dict)]})
+    return matches
+
+
+def _has_newer_coverage(topic: Topic, previous: list[dict]) -> bool:
+    def parse(value):
+        try:
+            return _parse_timestamp(value)
+        except (TypeError, ValueError): return None
+    latest_current = max((date for article in topic.articles if isinstance(article, dict)
+                          if (date := parse(article.get("publication_date") or article.get("retrieved_at")))),
+                         default=None)
+    latest_old = max((date for match in previous for article in match.get("articles", [])
+                      if (date := parse(article.get("publication_date") or article.get("retrieved_at")))),
+                     default=None)
+    if not (latest_current and latest_old and latest_current > latest_old):
+        return False
+    old_origins = {_canonical_origin(a) for m in previous for a in m.get("articles", []) if _canonical_origin(a)}
+    # Provenance records do not reliably label syndication or independent
+    # non-primary reporting. Only a new, explicitly primary source with its
+    # own evidence is strong enough; other cases remain Previously Covered.
+    for article in topic.articles:
+        if not isinstance(article, dict): continue
+        origin = _canonical_origin(article)
+        if article.get("primary") is True and article.get("evidence") and origin and origin not in old_origins:
+            return True
+    return False
+
+
+def _canonical_origin(article):
+    if not isinstance(article, dict): return None
+    value = article.get("original_source_url") or article.get("url")
+    if not isinstance(value, str): return None
+    parsed = urlparse(value)
+    if not parsed.scheme or not parsed.netloc: return None
+    return (parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path.rstrip("/"))
+
+
+def _strong_story_match(left, right):
+    if not isinstance(left, str) or not isinstance(right, str): return False
+    a, b = _tokens(left), _tokens(right)
+    if len(a) < 3 or len(b) < 3: return False
+    # Require at least three shared anchors so an entity plus a generic verb
+    # cannot join separate developments.
+    return _similar(left, right) and len(a & b) >= 3
+
+
 def format_briefing(run_id: str, topics: list[Topic]) -> str:
     eligible = [topic for topic in topics if topic.recommendation_eligible]
     lines = ["Today's research shortlist"]
@@ -373,6 +514,14 @@ def format_briefing(run_id: str, topics: list[Topic]) -> str:
     for rank, topic in enumerate(eligible[:10], 1):
         geo = topic.relevance.replace("_", "/")
         lines += [f"\n{rank}. {topic.headline}", f"{topic.category.replace('_', ' ').title()} · {geo} · {topic.verification_status}",
+                  f"Novelty: {topic.novelty_status.replace('_', ' ').title()}"]
+        if topic.previous_coverage:
+            prior = topic.previous_coverage[0]
+            lines.append(f"Earlier coverage: {prior.get('covered_at', 'date unavailable')} — {prior.get('headline', '')}")
+            for article in prior.get("articles", [])[:1]:
+                if article.get("url"):
+                    lines.append(f"Earlier source: {article.get('publisher') or 'Publisher'}: {article['url']}")
+        lines += [
                   f"Score {topic.score}/100 — {topic.score_explanation}", topic.summary[:240]]
         for source in topic.articles[:2]:
             lines.append(f"{source['publisher']}: {source['url']}")

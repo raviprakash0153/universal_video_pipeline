@@ -59,9 +59,10 @@ def _print_status(run_id, topics, statuses, *, verbose=False):
     print(f"Discovered topics: {len(topics)}")
     print("Categories: " + json.dumps(dict(Counter(t.category for t in topics)), sort_keys=True))
     print("Verification: " + json.dumps(dict(Counter(t.verification_status for t in topics)), sort_keys=True))
+    print("Novelty: " + json.dumps(dict(Counter(t.novelty_status for t in topics)), sort_keys=True))
     print("Final ranking:")
     for i, topic in enumerate(topics[:10], 1):
-        print(f" {i}. [{topic.score:.1f}] {topic.headline} — {topic.category}; {topic.verification_status}")
+        print(f" {i}. [{topic.score:.1f}] {topic.headline} — {topic.category}; {topic.verification_status}; {topic.novelty_status}")
         print(f"    Recommendation eligible: {topic.recommendation_eligible} — {topic.recommendation_reason}")
 
 
@@ -91,7 +92,8 @@ def _record_job_start(db, job_id):
 
 
 def run_research(*, config: ScheduleConfig | None = None, categories=None, coverage=None,
-                 preview=False, diagnostic=False, db_path=None, lock_path=None, send=False, verbose=False):
+                 preview=False, diagnostic=False, db_path=None, lock_path=None, send=False, verbose=False,
+                 novelty_lookback_days=intelligence.DEFAULT_NOVELTY_LOOKBACK_DAYS):
     config = validate_config(config or ScheduleConfig())
     selected = categories or {key: intelligence.CATEGORIES[key] for key in config.categories}
     coverage = coverage or config.coverage
@@ -121,6 +123,7 @@ def run_research(*, config: ScheduleConfig | None = None, categories=None, cover
             print(f"Progress: {key} — {value['status']}", flush=True)
         run_id, topics, statuses = intelligence.discover_topics(provider=provider, categories=selected,
             coverage=coverage, progress=progress)
+        intelligence.classify_novelty(topics, db_path=db_path, lookback_days=novelty_lookback_days)
         _print_status(run_id, topics, statuses, verbose=verbose)
         if diagnostic:
             print("Diagnostic pipeline detail (discovery, extraction, verification, and clustering):")
@@ -227,6 +230,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="Run, rank, persist and preview/send one research briefing")
     run.add_argument("--preview", "--dry-run", action="store_true")
+    run.add_argument("--novelty-lookback-days", type=int, default=intelligence.DEFAULT_NOVELTY_LOOKBACK_DAYS,
+                     help="Maximum age in days for historical story matching (default: 7)")
     run.add_argument("--diagnostic", action="store_true")
     run.add_argument("--verbose", action="store_true", help="Print every rejected record")
     run.add_argument("--category", action="append", choices=sorted(intelligence.CATEGORIES))
@@ -247,7 +252,7 @@ def main(argv=None):
             parser.error("unknown configured category: " + ", ".join(unknown))
         return 0 if run_research(config=cfg, categories={c: intelligence.CATEGORIES[c] for c in cats}, coverage=args.coverage,
                                  preview=args.preview, diagnostic=args.diagnostic, db_path=args.db, send=args.send,
-                                 verbose=args.verbose) else 1
+                                 verbose=args.verbose, novelty_lookback_days=args.novelty_lookback_days) else 1
     if args.command == "deliver":
         print(deliver_briefing(args.run_id, db_path=args.db, retry=args.retry)); return 0
     if args.command == "schedule-tick":

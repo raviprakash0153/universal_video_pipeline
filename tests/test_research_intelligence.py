@@ -12,6 +12,71 @@ from news_research import Article, NewsItem
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_cross_run_novelty_matches_headline_rewrite_and_keeps_evidence_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "research.db"
+            old = ri.Topic("old", "Nvidia unveils Blackwell AI chip architecture",
+                "summary", "technology_ai", "global", [{"url": "https://wire.test/a",
+                "original_source_url": "https://wire.test/a", "publisher": "Wire",
+                "headline": "Nvidia unveils Blackwell AI chip architecture",
+                "publication_date": "2026-11-20T00:00:00Z", "evidence": "Earlier details",
+                "primary": False}], [{"claim": "claim", "status": "DEVELOPING"}], "DEVELOPING")
+            ri.persist_research("old", [old], {}, db_path=db_path)
+            db = pipeline_store.connect(db_path)
+            db.execute("update research_runs set created_at=?", ("2026-11-23T00:00:00+00:00",)); db.commit(); db.close()
+            current = ri.Topic("current", "Nvidia reveals Blackwell architecture for AI processors",
+                "summary", "technology_ai", "global", [{"url": "https://wire.test/b",
+                "original_source_url": "https://wire.test/b", "publisher": "Wire",
+                "publication_date": "2026-11-24T00:00:00Z", "evidence": "Updated article",
+                "primary": False}], [{"claim": "new claim", "status": "CONFIRMED"}], "CONFIRMED")
+            before = (json.dumps(current.claims), current.verification_status, json.dumps(current.articles))
+            ri.classify_novelty([current], db_path=db_path)
+            self.assertEqual(current.novelty_status, "PREVIOUSLY_COVERED")
+            self.assertTrue(current.previous_coverage)
+            self.assertEqual(before, (json.dumps(current.claims), current.verification_status, json.dumps(current.articles)))
+
+    def test_cross_run_generic_or_short_similar_headlines_do_not_match(self):
+        for old_head, new_head in (("Officials announce new policy today", "Officials announce new tax today"),
+                                   ("Breaking news", "Breaking news")):
+            with self.subTest(old=old_head), tempfile.TemporaryDirectory() as directory:
+                db_path = Path(directory) / "research.db"
+                ri.persist_research("old", [ri.Topic("old", old_head, "s", "politics", "global")], {}, db_path=db_path)
+                db = pipeline_store.connect(db_path)
+                db.execute("update research_runs set created_at=?", ("2026-11-23T00:00:00+00:00",)); db.commit(); db.close()
+                current = ri.Topic("new", new_head, "s", "politics", "global")
+                ri.classify_novelty([current], db_path=db_path)
+                self.assertEqual(current.novelty_status, "NEW")
+
+    def test_minor_rewrite_and_newer_syndicated_copy_are_not_meaningful_updates(self):
+        previous = [{"headline": "Officials announce major ceasefire agreement",
+            "articles": [{"url": "https://wire.test/a", "original_source_url": "https://wire.test/a",
+                          "publication_date": "2026-11-20T00:00:00Z", "primary": True,
+                          "evidence": "Officials announce agreement"}]}]
+        topic = ri.Topic("t", "Officials announce historic major ceasefire agreement",
+            "s", "politics", "global", [{"url": "https://copy.test/a",
+            "original_source_url": "https://wire.test/a", "publication_date": "2026-11-24T00:00:00Z",
+            "primary": True, "evidence": "Officials announce agreement"}])
+        self.assertFalse(ri._has_newer_coverage(topic, previous))
+
+    def test_lookback_excludes_old_future_invalid_and_malformed_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "research.db"
+            ri.persist_research("old", [ri.Topic("old", "Researchers discover distant exoplanet",
+                "s", "science", "global")], {}, db_path=db_path)
+            db = pipeline_store.connect(db_path)
+            db.execute("update research_runs set created_at=?", ("2026-11-01T00:00:00Z",))
+            db.execute("insert into research_runs values(?,?,?)", ("future", "2026-11-25T00:00:00Z", "{}"))
+            db.execute("insert into research_topics values(?,?,?,?,?,?,?,?,?,?,?)", ("future:t", "t", "future",
+                "Researchers discover distant exoplanet", "s", "science", "global", "UNVERIFIED", 0, "{}",
+                json.dumps({"headline": "Researchers discover distant exoplanet", "articles": []})))
+            db.execute("insert into research_runs values(?,?,?)", ("bad", "not-a-date", "{}"))
+            db.execute("insert into research_topics values(?,?,?,?,?,?,?,?,?,?,?)", ("bad:t", "t", "bad",
+                "Researchers discover distant exoplanet", "s", "science", "global", "UNVERIFIED", 0, "{}", "[]"))
+            db.commit(); db.close()
+            current = ri.Topic("new", "Researchers discover distant exoplanet", "s", "science", "global")
+            ri.classify_novelty([current], db_path=db_path)
+            self.assertEqual(current.novelty_status, "NEW")
+
     def test_story_clustering_deduplicates_articles_and_keeps_distinct_publishers(self):
         a = Article("https://one.test/a", "One", "India launches new lunar mission today", evidence="details")
         b = Article("https://two.test/b", "Two", "India launches new lunar mission today", evidence="details")
