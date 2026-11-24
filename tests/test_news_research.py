@@ -845,10 +845,9 @@ class NewsResearchTests(unittest.TestCase):
 
     def test_page_without_article_evidence_is_inaccessible(self):
         provider = GoogleNewsRSSProvider()
-        response = type("Response", (), {"read": lambda self, n: b"<html><body>Cookie settings and navigation.</body></html>",
-                                          "geturl": lambda self: "https://ign.com/story", "__enter__": lambda self: self,
-                                          "__exit__": lambda *args: None})()
-        with patch("news_research.urlopen", return_value=response):
+        response = self._response(b"<html><body>Cookie settings and navigation.</body></html>")
+        with patch("news_research.build_opener", return_value=type(
+                "Opener", (), {"open": lambda *_, **__: response})()):
             result = provider.open(Article("https://news.google.com/x", "Google News", "GTA 6 announcement"))
         self.assertFalse(result.accessible)
         self.assertIsNone(result.evidence)

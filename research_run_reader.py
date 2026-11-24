@@ -34,6 +34,10 @@ def _open_readonly(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
 
 
+def _snapshot_established() -> None:
+    """Private synchronization seam for exercising the reader's transaction."""
+
+
 @dataclass
 class ValidationIssue:
     code: str
@@ -87,6 +91,9 @@ def _json(value: Any, where: str, issues: list[ValidationIssue], expected: type 
         if not isinstance(value, str):
             raise TypeError("JSON value must be text")
         parsed = json.loads(value)
+    except RecursionError:
+        issues.append(ValidationIssue("malformed_json", f"{where} exceeds the JSON nesting limit"))
+        return None
     except (TypeError, UnicodeError, json.JSONDecodeError):
         issues.append(ValidationIssue("malformed_json", f"{where} is not valid JSON"))
         return None
@@ -127,6 +134,7 @@ def read_research_run(database: str | Path, run_id: str) -> ResearchRun:
         runrow = db.execute("SELECT * FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
         if runrow is None:
             raise ResearchRunReadError(f"Run {run_id!r} does not exist")
+        _snapshot_established()
         run = dict(runrow)
         if not _timestamp(run["created_at"]):
             issues.append(ValidationIssue("invalid_timestamp", "research_runs.created_at must be timezone-aware ISO 8601"))
@@ -137,7 +145,11 @@ def read_research_run(database: str | Path, run_id: str) -> ResearchRun:
         links = [dict(row) for row in db.execute("SELECT * FROM claim_evidence WHERE run_id=?", (run_id,))]
         statuses = [dict(row) for row in db.execute("SELECT * FROM research_source_status WHERE run_id=?", (run_id,))]
         result = ResearchRun(run, topics, articles, claims, links, statuses, issues)
-        result.saved_content_status = "empty_saved_run" if not any((topics, articles, claims, links, statuses)) else "content_present_completion_indeterminate"
+        result.saved_content_status = (
+            "no_saved_child_records_completion_unknown"
+            if not any((topics, articles, claims, links, statuses))
+            else "content_present_completion_indeterminate"
+        )
 
         def unique(values, label):
             seen = set()

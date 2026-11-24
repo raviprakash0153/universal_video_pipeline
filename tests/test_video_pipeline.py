@@ -423,6 +423,28 @@ class LongRenderTests(unittest.TestCase):
             self.assertLess(vf.index("scale="), vf.index("drawbox"))
             self.assertEqual(list(Path(directory).glob("banner_*")), [])
 
+    def test_long_subtitles_are_shifted_to_trim_range_and_burned_after_scaling(self):
+        self.assertEqual(pipeline.words_for_range(
+            [(1, 2, "before"), (10, 11, "keep"), (19, 21, "edge"), (22, 23, "after")],
+            10, 20), [(0, 1, "keep"), (9, 10, "edge")])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "final.mp4"
+            commands = []
+            def encode(command, **kwargs):
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"encoded")
+            with patch.object(pipeline, "WORK", root), \
+                    patch.object(pipeline, "transcribe", return_value=[(10, 11, "hello")]) as transcribe, \
+                    patch.object(pipeline, "run", side_effect=encode), patch.object(pipeline, "verify"), \
+                    patch.object(pipeline.os, "link"):
+                pipeline.render_long(Path("source.mp4"), output, 10, 20, subtitle_model="small")
+            vf = commands[0][commands[0].index("-vf") + 1]
+            self.assertIn("scale=1920:1080", vf)
+            self.assertIn("ass=", vf)
+            self.assertEqual(transcribe.call_args.args, (Path("source.mp4"), "small"))
+            self.assertEqual(list(root.glob("*.ass")), [])
+
 
 class TemporaryCleanupTests(unittest.TestCase):
     def test_short_banner_renders_and_is_disabled_by_default(self):
@@ -596,6 +618,27 @@ class YouTubeMetadataTests(unittest.TestCase):
                     pipeline.main()
             self.assertEqual(upload.call_args.kwargs["category_id"], "27")
             self.assertEqual(upload.call_args.kwargs["tags"], ["podcast", "education"])
+
+    def test_upload_is_blocked_when_explicit_approval_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = root / "client.json"
+            client.write_text("placeholder")
+            output = root / "output"
+            output.mkdir()
+            args = ["video_pipeline.py", "long", "--source", "source.mp4", "--upload",
+                    "--client-secrets", str(client), "--rights-state", "owned",
+                    "--approval-file", "invalid-approval.json"]
+            with patch.object(sys, "argv", args), patch.object(pipeline, "OUTPUT", output), \
+                    patch.object(pipeline, "require_tool"), \
+                    patch.object(pipeline, "get_info", return_value={"title": "source", "duration": 30, "local": True}), \
+                    patch.object(pipeline, "acquire", return_value=Path("source.mp4")), \
+                    patch.object(pipeline, "render_long", side_effect=lambda source, path, start, end, *filters: path.write_bytes(b"video")), \
+                    patch.object(pipeline, "upload_youtube") as upload, \
+                    patch.object(pipeline, "validate_approval", side_effect=PermissionError("not approved")):
+                with patch("builtins.print"), self.assertRaises(SystemExit):
+                    pipeline.main()
+            upload.assert_not_called()
 
 
 class BothModeTests(unittest.TestCase):

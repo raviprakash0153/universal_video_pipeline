@@ -132,6 +132,26 @@ class CommandEngineTests(unittest.TestCase):
         self.assertEqual(job.caption_language, "original")
         self.assertIsNone(job.rights_confirmed)
         self.assertEqual(job.approval_state, "not_requested")
+        self.assertTrue(any("confirm" in item.lower() and "permission" in item.lower()
+                            for item in job.clarification_needed))
+
+    def test_video_request_requires_explicit_reuse_rights_confirmation(self):
+        cases = (
+            "Make a long video from https://youtu.be/abc. I own this video.",
+            "Make 2 Shorts from https://youtu.be/abc. I have permission to reuse it.",
+            "Make a video from https://youtu.be/abc. This footage is public domain.",
+        )
+        for phrase in cases:
+            with self.subTest(phrase=phrase):
+                job = process_command(phrase)
+                self.assertTrue(job.rights_confirmed)
+                self.assertFalse(any("reuse it" in item.lower() for item in job.clarification_needed))
+
+    def test_explicit_lack_of_rights_blocks_video_request(self):
+        job = process_command("Make a long video from https://youtu.be/abc. I don't have permission.")
+        self.assertFalse(job.rights_confirmed)
+        self.assertTrue(any("cannot be processed" in item for item in job.clarification_needed))
+        self.assertEqual(job.status, "pending_clarification")
 
     def test_hinglish_must_be_explicit(self):
         job = process_command("Make a long video in Hinglish from https://youtu.be/abc")

@@ -1,4 +1,4 @@
-"""Optional Telegram text adapter. It only parses commands and replies with the job."""
+"""Optional Telegram adapter for persistent intake and local production."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from news_research import (GoogleNewsRSSProvider, MultiSourceNewsProvider,
                            diagnose_explicit_google_urls, format_report, research_news)
 from research_intelligence import (discover_topics, format_briefing, persist_research)
 import pipeline_store
+import telegram_video_intake
 
 
 API_ROOT = "https://api.telegram.org/bot{token}/{method}"
@@ -170,6 +171,16 @@ def _reply_to_update(token: str, update: dict, allowed_user: str | None,
     if not allowed_user or str(sender.get("id")) != allowed_user:
         return
     if is_text:
+        # Persistent video intake runs before the established briefing/research
+        # routes, which remain available when no video request is active.
+        intake_response = telegram_video_intake.process_update(update, allowed_user)
+        if intake_response is not None:
+            telegram_video_intake.run_queued_production(notification_callback=lambda: _deliver_video_job_notifications(token))
+            _deliver_video_job_notifications(token)
+            _telegram_request(token, "sendMessage", {"chat_id": chat["id"], "text": intake_response})
+            telegram_video_intake.mark_reply_delivered(update_id)
+            replied_update_ids.add(update_id)
+            return
         if message["text"].strip().casefold() in {"brief", "briefing", "daily briefing", "/brief"}:
             response = _topic_selection_or_brief(message["text"], str(sender["id"]), news_provider)
             db = _research_db()
@@ -200,6 +211,13 @@ def _reply_to_update(token: str, update: dict, allowed_user: str | None,
 
 def _research_db():
     return pipeline_store.connect()
+
+
+def _deliver_video_job_notifications(token: str) -> None:
+    """Send durable production events; leave failed sends pending for retry."""
+    for event in telegram_video_intake.pending_job_notifications():
+        _telegram_request(token, "sendMessage", {"chat_id": event["chat_id"], "text": event["message"]})
+        telegram_video_intake.mark_job_notification_delivered(event["event_id"])
 
 
 def _topic_selection_or_brief(text: str, user_id: str, provider=None) -> str | None:
@@ -341,15 +359,22 @@ def run() -> int:
     retries = int(os.environ.get("NEWS_RETRY_LIMIT", "0"))
     news_provider = MultiSourceNewsProvider(rss=GoogleNewsRSSProvider(timeout=timeout, retries=retries))
     print("Telegram text/voice assistant is polling. News search uses configured social APIs and RSS discovery.")
+    telegram_video_intake.recover_interrupted_jobs()
     while True:
         try:
+            _deliver_video_job_notifications(token)
+            telegram_video_intake.run_queued_production(notification_callback=lambda: _deliver_video_job_notifications(token))
             query = {"timeout": 30, "allowed_updates": ["message"]}
             if offset is not None:
                 query["offset"] = offset
             updates = _telegram_request(token, "getUpdates", query)
             for update in updates:
-                offset = update["update_id"] + 1
                 _reply_to_update(token, update, allowed_user, replied_update_ids, news_provider)
+                # Telegram acknowledges updates only when the next getUpdates
+                # call uses this offset. A processing/send exception leaves it
+                # unchanged, so Telegram redelivers and the durable ledger can
+                # retry a pending intake response.
+                offset = update["update_id"] + 1
         except KeyboardInterrupt:
             return 0
         except RuntimeError as exc:

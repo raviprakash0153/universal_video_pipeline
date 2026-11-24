@@ -56,6 +56,13 @@ class CommandJob:
 _URL_RE = re.compile(r"https?://[^\s<>\]\[\)\}\,\;]+", re.IGNORECASE)
 _SHORTS_RE = re.compile(r"\b(\d+)\s+shorts?\b", re.IGNORECASE)
 _TOPIC_RE = re.compile(r"\b(?:about|on|regarding)\s+(.+?)[.!?]*$", re.IGNORECASE)
+_RIGHTS_NEGATIVE_RE = re.compile(
+    r"\b(?:i\s+(?:do\s+not|don't|dont)\s+(?:own|have permission)|"
+    r"(?:no|without)\s+(?:permission|rights)|not\s+mine)\b", re.IGNORECASE)
+_RIGHTS_POSITIVE_RE = re.compile(
+    r"\b(?:i\s+own\s+(?:(?:this|the|that)\s+)?(?:video|source|footage)|i\s+own\s+it|"
+    r"i\s+have\s+(?:permission|the rights)\s+to\s+(?:use|reuse|edit|republish)|"
+    r"(?:this|the)\s+(?:video|source|footage)\s+is\s+(?:licensed|public domain))\b", re.IGNORECASE)
 
 
 def _normalize_for_analysis(text: str) -> str:
@@ -156,6 +163,7 @@ def process_command(text: str, *, input_type: InputType | str = InputType.TEXT) 
     fmt: OutputFormat | None = None
     count: int | None = None
     topic: str | None = None
+    rights_confirmed: bool | None = None
 
     officiality_question = (re.search(r"\b(official|legit|real)\b", analysis_text)
                             and re.search(r"\b(announcement|announced|news|claim)\b", analysis_text))
@@ -196,6 +204,13 @@ def process_command(text: str, *, input_type: InputType | str = InputType.TEXT) 
             clarification.append("How many Shorts do you want?")
         if source_url is None:
             clarification.append("Please provide the source video URL.")
+        if _RIGHTS_NEGATIVE_RE.search(raw):
+            rights_confirmed = False
+            clarification.append("This source cannot be processed without reuse rights; provide a source you own or have permission to use.")
+        elif _RIGHTS_POSITIVE_RE.search(raw):
+            rights_confirmed = True
+        else:
+            clarification.append("Please confirm that you own this source or have permission to reuse it.")
     else:
         intent = Intent.UNKNOWN
         clarification.append("What would you like me to do?")
@@ -205,7 +220,7 @@ def process_command(text: str, *, input_type: InputType | str = InputType.TEXT) 
         job_id=str(uuid4()), input_type=input_type, raw_input=raw,
         intent=intent, source_url=source_url, topic_or_claim=topic,
         output_format=fmt, requested_shorts_count=count,
-        caption_language=caption_language, rights_confirmed=None,
+        caption_language=caption_language, rights_confirmed=rights_confirmed,
         status="pending_clarification" if clarification else "parsed",
         approval_state="not_requested", clarification_needed=clarification,
     )

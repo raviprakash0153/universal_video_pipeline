@@ -1,5 +1,142 @@
 # Universal Video Pipeline
 
+## Inspect YouTube metadata (no media download)
+
+To check a YouTube video's title, duration, available stream resolutions, audio formats, and quality eligibility, run:
+
+```sh
+python youtube_inspect.py 'https://www.youtube.com/watch?v=OIeLbmyraRQ'
+```
+
+This uses yt-dlp metadata-only mode (`--dump-single-json --no-download`). A successful metadata inspection is reported separately from whether the source meets the pipeline's 720p quality rules. Network, unavailable-video, restricted-video, and malformed-URL errors are reported as failed inspections.
+
+## Inspect YouTube captions only (no media download)
+
+Run the standalone caption probe:
+
+```sh
+python youtube_captions.py 'https://www.youtube.com/watch?v=OIeLbmyraRQ' --language en
+```
+
+It lists human and automatic caption languages using yt-dlp metadata, then retrieves a matching human track first (or an automatic track) as VTT. `--language` accepts a language code and defaults to `en`; `--output-dir PATH` selects a parent directory. Each run creates a new `youtube-captions-*` directory and never overwrites prior files. The report separates track listing, availability, retrieval, timestamp conversion, and analyzer suitability. Original VTT cue timestamps and text are kept. Only one-token-per-cue VTT can be converted without guessing into the analyzer's `{start, end, text}` word records; multiword captions remain segment-level and are reported as unsuitable for its word-level input.
+
+This command is caption-only: yt-dlp runs with `--skip-download` for both inspection and retrieval, and the command does not download or extract video or audio. It does not invoke production, Telegram, approval, publishing, or the source video. Track listing still requires network access; the caption text file is saved locally.
+
+## Local Telegram video MVP (macOS)
+
+This section operates the local video request flow. It downloads and renders locally, then waits for separate human review and approval before any YouTube upload. A rights reply is your declaration; the software cannot verify ownership or permission. Send a request only for material you are legally allowed to use.
+
+### Install and configure
+
+In Terminal, move to the project directory (adjust the path if needed):
+
+```sh
+cd ~/Documents/universal_video_pipeline
+```
+
+Install Python 3.10 or newer and Homebrew if needed. Install FFmpeg (which provides `ffmpeg` and `ffprobe`):
+
+```sh
+brew install ffmpeg
+ffmpeg -version
+ffprobe -version
+```
+
+Create a project-local Python environment and install `requirements.txt`:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The requirements install `yt-dlp`, `faster-whisper`, and the Google YouTube upload libraries. Whisper may download its model the first time captions are needed. Keep the virtual environment active in every Terminal window used for the bot or approval commands.
+
+Create a Telegram bot with BotFather and open a private chat with it. Set the token and your numeric Telegram user ID in Terminal. These prompts do not echo the token or place it in shell history:
+
+```sh
+read -s "TELEGRAM_BOT_TOKEN?Telegram bot token: " && export TELEGRAM_BOT_TOKEN
+printf '\n'
+read "TELEGRAM_ALLOWED_USER_ID?Your numeric Telegram user ID: " && export TELEGRAM_ALLOWED_USER_ID
+```
+
+The application reads environment variables from the process environment; it does not automatically load `.env.example`. Set `PIPELINE_DATABASE` before starting the bot if you want a different database, and use the same value for approval commands. If unset, the database is `<project directory>/output/pipeline.sqlite3`; its parent directory is created as needed:
+
+```sh
+export PIPELINE_DATABASE="$PWD/output/pipeline.sqlite3"
+```
+
+`PIPELINE_USER` optionally supplies the reviewer name (otherwise the current account name is used). `PIPELINE_MEDIA_ROOT` exists in settings, but current renders continue to use `output/`.
+
+### Start, request, and monitor
+
+With the virtual environment active and the variables set in that Terminal, start polling:
+
+```sh
+python telegram_text_dry_run.py --dry-run
+```
+
+Despite the historical filename and flag name, this starts the live Telegram poller; `--dry-run` is required by its parser and does not make polling a dry run. Keep the Terminal open. Press **Ctrl+C** to stop it. The poller also retains existing news and briefing routes.
+
+In the bot's private chat, start a request, for example:
+
+```text
+/video Make 2 Shorts from https://www.youtube.com/watch?v=VIDEO_ID
+```
+
+Reply to prompts with the required YouTube URL, format, Shorts count (when applicable), and caption language (`original` or `hinglish`). Send a separate rights statement: `I confirm I own this video` or `I confirm I have permission to reuse this video`. For long-form, request `long-form`; no Shorts count is needed. A combined request needs a Shorts count. If rights are declined, that request cannot proceed. Send `/cancel` while details are being collected to cancel it.
+
+When the required fields and positive rights statement are saved, the bot queues a local job. It sends a start message, production stage updates (with output kind and progress index where available), then a completion message with a separate output ID per output and review commands. Production through this bot does not upload or approve anything. If production fails, the bot reports an error. If the bot restarts during a running job, the job is marked failed with an uncertain outcome and is not automatically restarted; inspect the database and output files before requesting work again.
+
+### Inspect, preview, and decide on every output
+
+In a second Terminal, enter the project directory, activate `.venv`, and set the same `PIPELINE_DATABASE` if you selected one. For every output ID in the completion message, run:
+
+```sh
+python approval_cli.py inspect 'OUTPUT_ID'
+python approval_cli.py preview 'OUTPUT_ID'
+```
+
+`inspect` prints metadata and whether an approval is valid. `preview` validates the registered file with `ffprobe`, reports format, dimensions, duration, subtitle streams, rights and latest validation, then launches the default video player. Check that it plays and review it yourself: the recorded preview confirms player launch only, not playback or viewing. Approve or reject each output separately after review:
+
+```sh
+python approval_cli.py approve 'OUTPUT_ID' --by 'Your Name'
+python approval_cli.py reject 'OUTPUT_ID' --by 'Your Name'
+python approval_cli.py list --state approved
+python approval_cli.py list --state rejected
+```
+
+Both decisions require a preview of the current media and metadata. Approval is refused when rights are unknown, missing, or prohibited. Changed media or publishing metadata invalidates the old approval; preview and approve again after reviewing the changed output.
+
+### YouTube OAuth and publishing
+
+Publishing is optional and has not been verified here against a live YouTube account. Create a Google Cloud project, enable YouTube Data API v3, configure its OAuth consent screen, and create an OAuth Client ID of type **Desktop app**. Save its downloaded JSON in the project root as `client_secret.json`. Keep it private and out of Git. First publishing opens browser authorization and saves `youtube_token.json` in the project root; keep that private too. The code requests the `youtube.upload` scope.
+
+The generated output metadata defaults to `private`. Inspect metadata before publishing; `approval_cli.py publish` uses its saved privacy setting and has no privacy override. Publish only after checking the output's approval:
+
+```sh
+python approval_cli.py inspect 'OUTPUT_ID'
+python approval_cli.py publish 'OUTPUT_ID'
+```
+
+Publishing accepts only registered, approved YouTube outputs with a matching preview, media, metadata, and rights state. If an upload errors or the process stops after upload begins, its outcome is recorded as `uncertain`. Check YouTube Studio before taking further action; do not rerun publish blindly. The command does not offer retry for uncertain attempts.
+
+### Troubleshooting and verification limits
+
+- `ffmpeg` or `ffprobe` not found: run `brew install ffmpeg`, then confirm both version commands work in the same Terminal.
+- Python import errors: activate `.venv` and run `python -m pip install -r requirements.txt`.
+- Missing bot credentials: export `TELEGRAM_BOT_TOKEN` and numeric `TELEGRAM_ALLOWED_USER_ID` in the Terminal that starts the bot.
+- No bot response: use a private chat from the configured user ID; groups and other users are ignored.
+- More details requested: provide the supported YouTube URL, format, required Shorts count, caption language, and separate explicit rights statement.
+- Empty database: confirm bot and CLI use the same `PIPELINE_DATABASE`; the default is project-local `output/pipeline.sqlite3`.
+- Preview failure: check the registered file path, `ffprobe`, and default macOS video player.
+- OAuth failure: check the Desktop app client JSON location, YouTube Data API v3 enablement, and browser authorization.
+- Failed or interrupted job: review its reported error and local outputs before deciding whether to submit another request. Interrupted work is not automatically rerun.
+- Uncertain upload: check YouTube Studio before taking any further action; never retry automatically.
+
+The automated tests mock Telegram and YouTube interactions. They verify local behavior, not real Telegram polling, live YouTube downloads, Google OAuth, or YouTube uploads. Those live service steps have not been verified by these instructions.
+
 ## Local lifecycle database and approvals
 
 The production pipeline records jobs, source provenance, rights state, rendered
@@ -18,6 +155,7 @@ Use the approval CLI to review each platform output separately:
 ```sh
 python3 approval_cli.py list --state not_requested
 python3 approval_cli.py inspect <output-id>
+python3 approval_cli.py preview <output-id>
 python3 approval_cli.py approve <output-id> --by Ravi
 python3 approval_cli.py reject <output-id> --by Ravi
 python3 approval_cli.py list --state approved
@@ -25,8 +163,15 @@ python3 approval_cli.py list --state rejected
 python3 approval_cli.py list --state invalidated
 ```
 
-`inspect` shows the source rights, platform metadata, media location and SHA-256.
-Approval is refused for unknown, missing or prohibited rights, and for outputs
+`inspect` shows metadata; `preview` validates and probes the registered file with local
+`ffprobe`, displays format, dimensions, duration, subtitle streams, rights and
+the latest validation result, then launches the video in the system's default
+player. A preview records only that the configured local player launched successfully;
+it does not verify playback or that anyone watched the video. The preview is recorded
+against the registered media SHA-256 and exact publishing metadata only when hashes
+captured immediately before and after player launch match. Approve or reject after
+your own review. Both decisions require a preview of the current media and
+metadata. Approval is refused for unknown, missing or prohibited rights, and for outputs
 without registered media. Approval history is append-only; the database checks
 the current rights, platform, metadata and media hash again before publishing,
 and records an invalidation if the media or metadata changed. Reapproval always

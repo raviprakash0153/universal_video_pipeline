@@ -43,6 +43,7 @@ class VideoPipelineResult:
     output_paths: list[Path] = field(default_factory=list)
     youtube_video_ids: list[str] = field(default_factory=list)
     youtube_urls: list[str] = field(default_factory=list)
+    output_ids: list[str] = field(default_factory=list)
 
     @property
     def outputs(self) -> list[Path]:
@@ -228,6 +229,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             events.append(f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Karaoke,,0,0,0,,{{\\pos({width//2},{y})}}{line}")
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
+def words_for_range(words, start: float, end: float | None):
+    """Clip word timings to a rendered range and shift them to output time zero."""
+    selected = []
+    for word_start, word_end, token in words:
+        if word_end <= start or (end is not None and word_start >= end):
+            continue
+        selected.append((max(word_start, start) - start,
+                         (min(word_end, end) if end is not None else word_end) - start,
+                         token))
+    return selected
+
 def escape_filter_path(path: Path) -> str:
     # FFmpeg filter parser needs escaping for drive colon, apostrophe, comma, brackets.
     s = str(path.resolve()).replace("\\", "/")
@@ -327,7 +339,9 @@ def bounded_number(minimum: float, maximum: float, label: str):
 def render_long(source: Path, output: Path, start: float, end: float | None,
                 brightness: float = 0, contrast: float = 1.03, saturation: float = 1.05,
                 volume: float = 1.0, bass_gain: float = 0, banner: bool = False,
-                title: str | None = None, channel: str | None = None):
+                title: str | None = None, channel: str | None = None,
+                subtitle_model: str | None = None, whisper_language: str | None = None,
+                caption_language: str = "original"):
     if not math.isfinite(start) or start < 0 or (end is not None and (not math.isfinite(end) or end <= start)):
         raise ValueError("Start and end must be finite, non-negative times with end after start.")
     temp_handle = tempfile.NamedTemporaryFile(prefix=f".{output.stem}_", suffix=".mp4",
@@ -335,6 +349,7 @@ def render_long(source: Path, output: Path, start: float, end: float | None,
     temp = Path(temp_handle.name)
     temp_handle.close()
     banner_temp = None
+    subtitle_file = None
     try:
         cmd = ["ffmpeg", "-y"]
         if start > 0:
@@ -350,6 +365,13 @@ def render_long(source: Path, output: Path, start: float, end: float | None,
         if banner:
             banner_temp = tempfile.TemporaryDirectory(prefix="banner_", dir=WORK)
             video_filter += "," + banner_filter(1920, 1080, title or "", channel or "", Path(banner_temp.name))
+        if subtitle_model:
+            subtitle_file = WORK / f"{output.stem}_{uuid.uuid4().hex}.ass"
+            words = transcribe(source, subtitle_model, language=whisper_language)
+            words = words_for_range(words, start, end)
+            if words:
+                write_ass(words, subtitle_file, 1920, 1080, 48, 940, caption_language)
+                video_filter += f",ass='{escape_filter_path(subtitle_file)}'"
         audio_filter = "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
         if volume != 1.0:
             audio_filter += f",volume={volume:g}"
@@ -368,6 +390,8 @@ def render_long(source: Path, output: Path, start: float, end: float | None,
         temp.unlink(missing_ok=True)
         if banner_temp is not None:
             banner_temp.cleanup()
+        if subtitle_file is not None:
+            subtitle_file.unlink(missing_ok=True)
 
 def verify(path: Path):
     result = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time,width,height",
@@ -538,7 +562,8 @@ def process_video(*, mode: str, source: str, start: float | None = None,
         try:
             render_long(acquired, out, resolved_long_start, resolved_long_end, brightness, contrast,
                         saturation, volume, bass_gain, banner, title or info.get("title"),
-                        info.get("uploader") or channel_name)
+                        info.get("uploader") or channel_name,
+                        subtitle_model, whisper_language, caption_language)
         except Exception as exc:
             out.unlink(missing_ok=True)
             raise RuntimeError(f"Long-form output failed ({out}): {exc}") from exc
@@ -553,6 +578,7 @@ def process_video(*, mode: str, source: str, start: float | None = None,
                     "category_id": category_id, "platform": "youtube"}
         asset_id = register_asset(lifecycle_db, job_id, path)
         output_id = f"{job_id}:{path.stem}:youtube"
+        result.output_ids.append(output_id)
         create_platform_output(lifecycle_db, output_id, job_id, "youtube", asset_id=asset_id,
                                metadata=metadata)
         record_validation(lifecycle_db, output_id, "passed", {"container": "mp4", "rendered_output": True})

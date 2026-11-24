@@ -1,9 +1,12 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import research_run_reader
 from research_run_reader import ResearchRunReadError, _open_readonly, read_research_run
 
 
@@ -54,7 +57,7 @@ class ResearchRunReaderTests(unittest.TestCase):
         empty = read_research_run(self.dbpath, "empty")
         self.assertTrue(empty.valid)
         self.assertEqual(empty.completion_status, "unknown")
-        self.assertEqual(empty.saved_content_status, "empty_saved_run")
+        self.assertEqual(empty.saved_content_status, "no_saved_child_records_completion_unknown")
         self.assertEqual(empty.topics, [])
         self.assertEqual(self.logical_dump(), before)
         ro = _open_readonly(self.dbpath)
@@ -66,7 +69,22 @@ class ResearchRunReaderTests(unittest.TestCase):
         path = Path(self.tmp.name) / "spaces ? and #.sqlite3"
         con = sqlite3.connect(path); con.executescript(SCHEMA)
         con.execute("insert into research_runs values(?,?,?)", ("empty", STAMP, "{}")); con.commit(); con.close()
-        self.assertEqual(read_research_run(path, "empty").saved_content_status, "empty_saved_run")
+        self.assertEqual(read_research_run(path, "empty").saved_content_status, "no_saved_child_records_completion_unknown")
+
+    def test_empty_run_with_invalid_metadata_remains_unconfirmed(self):
+        self.db.execute("update research_runs set source_status_json='not json' where run_id='empty'")
+        self.db.commit()
+        result = read_research_run(self.dbpath, "empty")
+        self.assertEqual(result.saved_content_status, "no_saved_child_records_completion_unknown")
+        self.assertEqual(result.completion_status, "unknown")
+        self.assertIn("malformed_json", {issue.code for issue in result.validation_issues})
+        self.assertNotEqual(result.saved_content_status, "empty_saved_run")
+
+    def test_no_run_is_classified_as_genuinely_empty_without_completion_evidence(self):
+        for run_id in ("empty", "complete"):
+            result = read_research_run(self.dbpath, run_id)
+            self.assertNotEqual(result.saved_content_status, "empty_saved_run")
+            self.assertEqual(result.completion_status, "unknown")
 
     def test_duplicate_associations_are_reported(self):
         self.db.execute("insert into discovered_articles values(?,?,?,?,?,?,?)", ("complete", "t1", "https://example.com/a", "Example", None, STAMP, '{"url":"https://example.com/a"}'))
@@ -99,17 +117,74 @@ class ResearchRunReaderTests(unittest.TestCase):
         codes = {i.code for i in read_research_run(self.dbpath, "complete").validation_issues}
         self.assertNotIn("invalid_timestamp", codes)
 
+    def test_deeply_nested_json_is_reported_as_validation_issue(self):
+        nested = "[" * 2000 + "0" + "]" * 2000
+        self.db.execute("update research_topics set score_json=? where run_id='complete'", (nested,))
+        self.db.commit()
+
+        result = read_research_run(self.dbpath, "complete")
+        recursion_issues = [issue for issue in result.validation_issues if issue.code == "malformed_json"]
+        self.assertEqual(len(recursion_issues), 1)
+        self.assertIn("topic t1 score_json", recursion_issues[0].message)
+        self.assertIn("nesting limit", recursion_issues[0].message)
+        self.assertFalse(result.valid)
+
     def test_reads_one_snapshot_while_writer_commits(self):
         path = Path(self.tmp.name) / "snapshot.sqlite3"
-        writer = sqlite3.connect(path); writer.executescript(SCHEMA)
-        writer.execute("PRAGMA journal_mode=WAL")
-        writer.execute("insert into research_runs values(?,?,?)", ("r", STAMP, "{}")); writer.commit()
-        reader = _open_readonly(path); reader.execute("BEGIN")
-        reader.execute("select name from sqlite_master").fetchall()
-        writer.execute("insert into research_topics values(?,?,?,?,?,?,?,?,?,?,?)", ("id", "t", "r", "h", "s", "c", "r", "v", 1, "{}", "{}")); writer.commit()
-        # Once its first read established the snapshot, this connection cannot see the later commit.
-        self.assertEqual(reader.execute("select * from research_topics where run_id='r'").fetchall(), [])
-        reader.rollback(); reader.close(); writer.close()
+        writer = sqlite3.connect(path)
+        snapshot_ready = threading.Event()
+        writer_committed = threading.Event()
+
+        def pause_after_snapshot():
+            snapshot_ready.set()
+            if not writer_committed.wait(5):
+                raise TimeoutError("writer did not commit during reader snapshot")
+
+        result_box = []
+        error_box = []
+        fresh_reader = None
+
+        def read():
+            try:
+                result_box.append(read_research_run(path, "r"))
+            except BaseException as exc:
+                error_box.append(exc)
+
+        thread = None
+        try:
+            writer.executescript(SCHEMA)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("insert into research_runs values(?,?,?)", ("r", STAMP, "{}"))
+            writer.commit()
+
+            with patch.object(research_run_reader, "_snapshot_established", pause_after_snapshot):
+                thread = threading.Thread(target=read)
+                thread.start()
+                self.assertTrue(snapshot_ready.wait(5), "reader did not establish its snapshot")
+                writer.execute("insert into research_topics values(?,?,?,?,?,?,?,?,?,?,?)", ("id", "t", "r", "h", "s", "c", "r", "v", 1, "{}", "{}"))
+                writer.commit()
+                writer_committed.set()
+                thread.join(5)
+            fresh_reader = sqlite3.connect(path)
+            topic_count = fresh_reader.execute("select count(*) from research_topics where run_id='r'").fetchone()[0]
+        finally:
+            # Always release and join the reader, including when a write or assertion fails.
+            writer_committed.set()
+            if thread is not None:
+                thread.join(5)
+            try:
+                if thread is not None:
+                    self.assertFalse(thread.is_alive(), "reader thread is still alive after bounded cleanup join")
+            finally:
+                try:
+                    if fresh_reader is not None:
+                        fresh_reader.close()
+                finally:
+                    writer.close()
+        self.assertEqual(error_box, [])
+        self.assertEqual(result_box[0].topics, [])
+        self.assertEqual(result_box[0].saved_content_status, "no_saved_child_records_completion_unknown")
+        self.assertEqual(topic_count, 1)
 
     def test_missing_db_and_run_do_not_create_files(self):
         missing_dir = Path(self.tmp.name) / "missing"
