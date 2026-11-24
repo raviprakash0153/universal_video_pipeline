@@ -13,6 +13,8 @@ import uuid
 import pipeline_store
 import research_intelligence as intelligence
 import research_quality
+import offline_research_evaluation
+from evaluation_bundle import BundleValidationError
 from news_research import (GoogleNewsRSSProvider, MultiSourceNewsProvider,
                            diagnose_production_discovery)
 from research_scheduler import (DEFAULT_CONFIG, LocalScheduler, ScheduleConfig, install_launchd,
@@ -258,6 +260,9 @@ def main(argv=None):
     quality.add_argument("--run-id", help="Limit historical evaluation to one run")
     quality.add_argument("--db", help="SQLite database to read (historical mode)")
     quality.add_argument("--diagnostic", action="store_true", help="Print detailed metric availability and warnings")
+    offline_eval = sub.add_parser("evaluate-bundles", help="Evaluate saved annotation bundles offline")
+    offline_eval.add_argument("--bundle", action="append", required=True, help="Evaluation bundle JSON (repeat to compare runs)")
+    offline_eval.add_argument("--output", help="Optional path for deterministic JSON results")
     retry = sub.add_parser("deliver"); retry.add_argument("--run-id", required=True); retry.add_argument("--retry", action="store_true"); retry.add_argument("--db")
     tick = sub.add_parser("schedule-tick", help="Internal one-minute scheduler tick; safe to invoke manually")
     tick.add_argument("--config", default=str(DEFAULT_CONFIG)); tick.add_argument("--db")
@@ -287,6 +292,15 @@ def main(argv=None):
         else:
             data = research_quality.evaluate(research_quality.synthetic_fixtures(), source="synthetic")
         print(research_quality.report(data, detailed=args.diagnostic))
+        return 0
+    if args.command == "evaluate-bundles":
+        try:
+            data = offline_research_evaluation.evaluate_paths(args.bundle)
+        except BundleValidationError as exc:
+            parser.error(str(exc))
+        print(offline_research_evaluation.report(data))
+        if args.output:
+            Path(args.output).write_text(offline_research_evaluation.dumps_report(data), encoding="utf-8")
         return 0
     if args.command == "schedule-tick":
         cfg = load_config(args.config)

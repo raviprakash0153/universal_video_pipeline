@@ -162,6 +162,20 @@ mode opens SQLite with read-only URI access and does not modify or create the
 database. Evaluation makes
 no network requests, publishes nothing, and sends no messages.
 
+### Phase 5B.7.3 offline research evaluation
+
+Compare saved evaluation bundles against independent annotations, entirely
+offline. Repeat `--bundle` to compare runs; `--output` writes deterministic
+JSON alongside the readable terminal report:
+
+```sh
+python3 research_cli.py evaluate-bundles --bundle output/evaluation/run-a.json
+python3 research_cli.py evaluate-bundles --bundle run-a.json --bundle run-b.json --output evaluation-results.json
+```
+
+Metrics, denominators, annotation gaps and unsupported measures are documented
+in [docs/real_world_evaluation.md](docs/real_world_evaluation.md).
+
 Telegram credentials are read from the shell environment. To enter the token
 without echoing it or placing it in shell history, use:
 

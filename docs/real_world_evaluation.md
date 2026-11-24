@@ -116,3 +116,38 @@ tests in `tests/test_evaluation_bundle.py` use synthetic objects and establish
 serialization/validation behavior only; they are not real-world quality
 results. The existing research pipeline is not changed or invoked by this
 format.
+
+## Phase 5B.7.3: offline evaluation
+
+Evaluate saved bundles without network access or pipeline execution:
+
+```sh
+python3 research_cli.py evaluate-bundles --bundle output/evaluation/run-a.json
+python3 research_cli.py evaluate-bundles --bundle run-a.json --bundle run-b.json --output evaluation-results.json
+```
+
+The evaluator compares only `pipeline_predictions.categories` with each
+candidate's independently supplied `annotations.categories`. Per-category and
+micro precision, recall, and F1 use only `relevant` and `not_relevant` labels.
+Each metric reports its sample count plus separate precision and recall
+denominators; zero denominators produce unavailable values. Unknown,
+not-assessable, and unannotated selected-category slots are
+counted separately. Fewer than 10 assessable labels is descriptive only.
+Output JSON is sorted and deterministic, and source bundles are read-only.
+
+The schema has no human relevance grades, explicit shortlist selection or
+relevance labels, and no defined prediction-to-annotation mapping for evidence
+or verification states. Those measures are explicitly unavailable. Duplicate
+grouping consistency is reported only for repeated annotated story groups where
+every candidate also has a predicted `story_group_id`; this measures agreement
+within those groups, not correct syndicated-source handling. The schema does
+not support a syndication prediction metric. This evaluation does not establish
+future engagement, virality, monetization, or factual accuracy.
+
+Missing or malformed category predictions are excluded from label denominators
+and counted as prediction-unavailable, never treated as negative predictions.
+Predicted category assignments without assessable reviewer labels are counted
+separately and excluded from classification metrics.
+For geography, primary-source, evidence, corroboration, source identity,
+syndication, and assessability annotations, unknown and not-assessable counts
+and rates are reported separately with candidate-count denominators.
